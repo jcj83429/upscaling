@@ -24,54 +24,84 @@ inDir = sys.argv[1]
 parentDir, inDirBaseName = os.path.split(inDir)
 outDirLR = os.path.join(parentDir, inDirBaseName+f'_LR_{FACTOR}x_degraded')
 outDirHR = os.path.join(parentDir, inDirBaseName+f'_LR_{FACTOR}x_gt')
+try:
+    os.mkdir(outDirLR)
+except FileExistsError:
+    pass
+try:
+    os.mkdir(outDirHR)
+except FileExistsError:
+    pass
 
-optionsPerImage = int(sys.argv[2])
-
-def resizeOptions(n, inX, inY):
+def resizeOptions(inX, inY):
     assert inX % FACTOR == 0
     assert inY % FACTOR == 0
     outX = inX // FACTOR
     outY = inY // FACTOR
-    options = {}
-    for _ in range(n):
-        # Although the model is focused on low quality blurry/haloey sources, if not trained with high quality sharp sources it can handle them very poorly.
-        cleanDigitalDownscale = HQ_SCALE or random.randrange(2) == 0
-        finalFilterChoices = ['Triangle', 'Catrom', 'Lanczos', 'Spline']
-        finalFilterWeights = [2, 2, 2, 2]
-        if cleanDigitalDownscale:
-            # Box is less common but it produces more aliasing so it is useful to add some samples.
-            # It is only used with one-step integer ratio scaling to avoid weirdness.
-            finalFilterChoices += ['Box']
-            finalFilterWeights += [1]
-        finalFilter = random.choices(finalFilterChoices, finalFilterWeights)[0]
 
-        name = ''
-        flags = []
-        if not cleanDigitalDownscale:
-            # Unsharp is more commonly seen on film and photo.
-            # Electronic/digital FIR filter is more commonly seen on video, and it can achieve a level of nastiness that unsharp cannot.
-            sharpeningMode = random.choices([None, 'unsharp', 'fir'], [2, 1, 1])[0]
+    # Although the model is focused on low quality blurry/haloey sources, if not trained with high quality sharp sources it can handle them very poorly.
+    cleanDigitalDownscale = HQ_SCALE or random.randrange(2) == 0
 
-            intermediateFilter = random.choice(['Triangle', 'Catrom', 'Lanczos', 'Spline', 'Jinc'])
-            isInterlaced = random.randrange(5) == 0
-            downX = random.randrange(outX * 3 // 5, outX * 5 // 4)
-            if isInterlaced:
-                interlaceFilter = random.choice(['Lanczos', 'Catrom', 'Triangle', 'Box'])
-                if random.randrange(3) == 0:
-                    downY = outY // 2 # just bad deinterlacing, no rescaling
-                else:
-                    downY = random.randrange(outY * 2 // 5, outY * 4 // 5)
-                # Focus on point. Bilinear and Bicubic are not very different from multiple scaling
-                deintFilter = random.choices(['Point', 'Triangle', 'Catrom'], [2, 1, 1])[0]
+    finalFilterChoices = ['Triangle', 'Catrom', 'Lanczos', 'Spline']
+    if cleanDigitalDownscale:
+        # Box is less common but it produces more aliasing so it is useful to add some samples.
+        # It is only used with one-step integer ratio scaling to avoid rounding weirdness.
+        finalFilterChoices += ['Box']
+    finalFilter = random.choice(finalFilterChoices)
+
+    if finalFilter == 'Box':
+        # Box is only done digitally in low quality software so it is always gamma light.
+        useLinearLight = False
+    else:
+        # Downscaling with linear light expands bright areas. Downscaling with gamma light expands dark areas.
+        # Neither extreme looks fully correct. Train with a mix of both to get a compromise.
+        # Because box (10% probability) is always gamma, the overall mix is 63% linear 37% gamma
+        useLinearLight = random.choices([True, False], [7, 3])[0]
+
+    linearLightFlags = ['-colorspace', 'RGB']
+    gammaLightFlags = ['-colorspace', 'sRGB']
+
+    name = ''
+    flags = []
+
+    if useLinearLight:
+        name += 'l-'
+        flags += linearLightFlags
+    else:
+        name += 'g-'
+
+    if not cleanDigitalDownscale:
+        # Unsharp is more commonly seen on film and photo.
+        # Electronic/digital FIR filter is more commonly seen on video, and it can achieve a level of nastiness that unsharp cannot.
+        sharpeningMode = random.choices([None, 'unsharp', 'fir'], [2, 1, 1])[0]
+
+        intermediateFilter = random.choice(['Triangle', 'Catrom', 'Lanczos', 'Spline', 'Jinc'])
+        isInterlaced = random.randrange(5) == 0
+        downX = random.randrange(outX * 3 // 5, outX * 5 // 4)
+        if isInterlaced:
+            interlaceFilter = random.choice(['Lanczos', 'Catrom', 'Triangle', 'Box'])
+            if random.randrange(3) == 0:
+                downY = outY // 2 # just bad deinterlacing, no rescaling
             else:
-                downY = random.randrange(outY * 3 // 4, outY * 5 // 4)
+                downY = random.randrange(outY * 2 // 5, outY * 4 // 5)
+            # Focus on point. Bilinear and Bicubic are not very different from multiple scaling
+            deintFilter = random.choices(['Point', 'Triangle', 'Catrom'], [2, 1, 1])[0]
+        else:
+            downY = random.randrange(outY * 3 // 4, outY * 5 // 4)
 
-            if isInterlaced:
-                name += f'{intermediateFilter}-{interlaceFilter}-{downX}x{downY*2}i-'
-                flags += ['-filter', intermediateFilter, '-resize', f'{downX}x{downY*2}!', '-filter', interlaceFilter, '-resize', f'{downX}x{downY}!']
-            else:
-                name += f'{intermediateFilter}-{downX}x{downY}-'
-                flags += ['-filter', intermediateFilter, '-resize', f'{downX}x{downY}!']
+        if isInterlaced:
+            name += f'{intermediateFilter}-{interlaceFilter}-{downX}x{downY*2}i-'
+            flags += ['-filter', intermediateFilter, '-resize', f'{downX}x{downY*2}!', '-filter', interlaceFilter, '-resize', f'{downX}x{downY}!']
+        else:
+            name += f'{intermediateFilter}-{downX}x{downY}-'
+            flags += ['-filter', intermediateFilter, '-resize', f'{downX}x{downY}!']
+
+        if sharpeningMode or isInterlaced:
+            # Always sharpen in gamma. Sharpening in linear light produces extremely nasty dark halos.
+            # Some real sources are actually like that but it is too extreme.
+            # Deinterlacing is assumed to be in gamma light.
+            if useLinearLight:
+                flags += gammaLightFlags
 
             if sharpeningMode == 'unsharp':
                 radius = random.choice([1,2,3])
@@ -101,10 +131,16 @@ def resizeOptions(n, inX, inY):
                 name += f'{deintFilter}-'
                 flags += ['-filter', deintFilter, '-resize', f'{downX}x{downY*2}!']
 
-        name += f'{finalFilter}'
-        flags += ['-filter', finalFilter, '-resize', f'{outX}x{outY}!']
-        options[name] = flags
-    return options
+            if useLinearLight:
+                flags += linearLightFlags
+
+    name += f'{finalFilter}'
+    flags += ['-filter', finalFilter, '-resize', f'{outX}x{outY}!']
+
+    if useLinearLight:
+        flags += gammaLightFlags # output gamma light
+
+    return name, flags
 
 # Text addition is a part of the degrade script because text may need to be added before or after degrade
 def textOptions(inX, inY, minSize):
@@ -307,102 +343,102 @@ def textOptions(inX, inY, minSize):
 def processInFile(inFile):
     inFilePath = os.path.join(inDir, inFile)
     inX, inY = Image.open(inFilePath).size
-    options = resizeOptions(optionsPerImage, inX, inY)
     baseName = os.path.splitext(inFile)[0]
-    lowPngCompressionFlags = ['-quality', '10'] # use worse compression for temporary files to go faster
-    for name, flags in options.items():
-        # Insert text before or after resize/blur/sharpen
-        textMode = None
-        if TEXT:
-            if inX >= 512:
-                textMode = random.choices([None, 'clean', 'degraded'], [1, 1, 3])[0]
-            elif inX >= 256:
-                textMode = random.choices([None, 'clean', 'degraded'], [4, 1, 3])[0]
+    lowPngCompressionFlags = ['-quality', '0'] # use worse compression for temporary files to go faster
 
-        if textMode:
-            if textMode == 'clean':
-                name = f'{name}-text'
-                minSize = 24
-            else:
-                name = f'text-{name}'
-                minSize = 36
-            textFlags = textOptions(inX, inY, minSize)
+    name, flags = resizeOptions(inX, inY)
+    # Insert text before or after resize/blur/sharpen
+    textMode = None
+    if TEXT:
+        if inX >= 512:
+            textMode = random.choices([None, 'clean', 'degraded'], [1, 1, 3])[0]
+        elif inX >= 256:
+            textMode = random.choices([None, 'clean', 'degraded'], [4, 1, 3])[0]
 
-        # there is no lossless option. high quality compressed is close enough
-        # we need both jpg and asp. imagemagick's jpg leans towards mosquito noise. ffmpeg's asp encoder leans toward blocking.
-        compression = random.choices(['jpg', 'asp', 'h264', 'vp9', 'h265'], [10, 15, 40, 15, 20])[0]
-        if compression == 'jpg':
-            quality = random.randrange(70 if HQ_COMP else 60, 90)
-        elif compression == 'asp':
-            quality = random.randrange(1, 7 if HQ_COMP else 8)
-        elif compression == 'h264':
-            quality = random.randrange(16, 23 if HQ_COMP else 25)
-        elif compression == 'vp9':
-            quality = random.randrange(30, 45 if HQ_COMP else 50)
-        elif compression == 'h265':
-            quality = random.randrange(19, 26 if HQ_COMP else 28)
+    if textMode:
+        if textMode == 'clean':
+            name = f'{name}-text'
+            minSize = 24
         else:
-            assert False
-        quality = str(quality)
-        name += f'-{compression}-{quality}'
+            name = f'text-{name}'
+            minSize = 36
+        textFlags = textOptions(inX, inY, minSize)
 
-        outBaseName = baseName + '-' + name
-        outFilePath = os.path.join(outDirLR, outBaseName+'.png')
-        outLlFilePath = os.path.join(outDirLR, outBaseName+'.ll.png')
-        outHrFilePath = os.path.join(outDirHR, outBaseName+'.png')
+    # there is no lossless option. high quality compressed is close enough
+    # we need both jpg and asp. imagemagick's jpg leans towards mosquito noise. ffmpeg's asp encoder leans toward blocking.
+    compression = random.choices(['jpg', 'asp', 'h264', 'vp9', 'h265'], [10, 15, 40, 15, 20])[0]
+    if compression == 'jpg':
+        quality = random.randrange(70 if HQ_COMP else 60, 90)
+    elif compression == 'asp':
+        quality = random.randrange(1, 7 if HQ_COMP else 8)
+    elif compression == 'h264':
+        quality = random.randrange(16, 23 if HQ_COMP else 25)
+    elif compression == 'vp9':
+        quality = random.randrange(30, 45 if HQ_COMP else 50)
+    elif compression == 'h265':
+        quality = random.randrange(19, 26 if HQ_COMP else 28)
+    else:
+        assert False
+    quality = str(quality)
+    name += f'-{compression}-{quality}'
 
-        print(outBaseName)
+    outBaseName = baseName + '-' + name
+    outFilePath = os.path.join(outDirLR, outBaseName+'.png')
+    outLlFilePath = os.path.join(outDirLR, outBaseName+'.ll.png')
+    outHrFilePath = os.path.join(outDirHR, outBaseName+'.png')
 
-        if textMode == 'degraded':
-            subprocess.run(['convert', inFilePath] + textFlags + [outHrFilePath], check=True, capture_output=True)
-            subprocess.run(['convert', outHrFilePath] + flags + [outLlFilePath], check=True, capture_output=True)
-        elif textMode == 'clean':
-            textLayerFilePath = os.path.join(outDirHR, outBaseName+'-textlayer.png')
-            subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:transparent'] + textFlags + lowPngCompressionFlags + [textLayerFilePath], check=True, capture_output=True)
-            subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite', outHrFilePath], check=True, capture_output=True)
-            textResizeFilter = random.choice(['Box', 'Triangle', 'Catrom', 'Lanczos', 'Spline'])
-            subprocess.run(['convert', inFilePath] + flags + ['(', textLayerFilePath, '-filter', textResizeFilter, '-resize', f'{inX//FACTOR}x{inY//FACTOR}!', ')', '-composite'] + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
-            os.remove(textLayerFilePath)
-        else:
-            subprocess.run(['convert', inFilePath] + flags + [outLlFilePath], check=True, capture_output=True)
-            os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
+    print(outBaseName)
 
-        if compression == 'jpg':
-            outTmpFilePath = outFilePath+'.jpg'
-            subprocess.run(['convert', outLlFilePath, '-quality', quality, outTmpFilePath], check=True, capture_output=True)
-            subprocess.run(['convert', outTmpFilePath, outFilePath], check=True, capture_output=True)
-            os.remove(outTmpFilePath)
-        elif compression == 'asp':
-            outTmpFilePath = outFilePath+'.avi'
-            # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
-            subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            os.remove(outTmpFilePath)
-        elif compression == 'h264':
-            outTmpFilePath = outFilePath+'.264'
-            x264tune = random.choice([[], ['-tune', 'film'], ['-tune', 'grain']])
-            # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
-            subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264tune + [ '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            os.remove(outTmpFilePath)
-        elif compression == 'h265':
-            outTmpFilePath = outFilePath+'.265'
-            # x265 uses ~40% psy-rd strength for I frames. See source/encoder/rdcost.h. To get more typical distortions (microbanding) seen on P/B frames, increase psyRd from default 2 to 5.
-            x265params = 'psy-rd=5'
-            if random.randrange(2) == 0:
-                # Disabling sao is a popular setting. It also generates stronger artifacts
-                x265params += ',sao=0'
-            subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-x265-params', x265params, '-pix_fmt', 'yuv420p10le', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            os.remove(outTmpFilePath)
-        elif compression == 'vp9':
-            outTmpFilePath = outFilePath+'.webm'
-            subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', '-c:v', 'libvpx-vp9', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-            os.remove(outTmpFilePath)
-        else:
-            assert False
-        os.remove(outLlFilePath)
+    if textMode == 'degraded':
+        subprocess.run(['convert', inFilePath] + textFlags + [outHrFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', outHrFilePath] + flags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+    elif textMode == 'clean':
+        textLayerFilePath = os.path.join(outDirHR, outBaseName+'-textlayer.png')
+        subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:transparent'] + textFlags + lowPngCompressionFlags + [textLayerFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite', outHrFilePath], check=True, capture_output=True)
+        textResizeFilter = random.choice(['Box', 'Triangle', 'Catrom', 'Lanczos', 'Spline'])
+        subprocess.run(['convert', inFilePath] + flags + ['(', textLayerFilePath, '-filter', textResizeFilter, '-resize', f'{inX//FACTOR}x{inY//FACTOR}!', ')', '-composite'] + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+        os.remove(textLayerFilePath)
+    else:
+        subprocess.run(['convert', inFilePath] + flags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+        os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
+
+    if compression == 'jpg':
+        outTmpFilePath = outFilePath+'.jpg'
+        subprocess.run(['convert', outLlFilePath, '-quality', quality, outTmpFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', outTmpFilePath, outFilePath], check=True, capture_output=True)
+        os.remove(outTmpFilePath)
+    elif compression == 'asp':
+        outTmpFilePath = outFilePath+'.avi'
+        # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        os.remove(outTmpFilePath)
+    elif compression == 'h264':
+        outTmpFilePath = outFilePath+'.264'
+        x264tune = random.choice([[], ['-tune', 'film'], ['-tune', 'grain']])
+        # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264tune + [ '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        os.remove(outTmpFilePath)
+    elif compression == 'h265':
+        outTmpFilePath = outFilePath+'.265'
+        # x265 uses ~40% psy-rd strength for I frames. See source/encoder/rdcost.h. To get more typical distortions (microbanding) seen on P/B frames, increase psyRd from default 2 to 5.
+        x265params = 'psy-rd=5'
+        if random.randrange(2) == 0:
+            # Disabling sao is a popular setting. It also generates stronger artifacts
+            x265params += ',sao=0'
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-x265-params', x265params, '-pix_fmt', 'yuv420p10le', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        os.remove(outTmpFilePath)
+    elif compression == 'vp9':
+        outTmpFilePath = outFilePath+'.webm'
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', '-c:v', 'libvpx-vp9', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        os.remove(outTmpFilePath)
+    else:
+        assert False
+    os.remove(outLlFilePath)
 
 inFiles = os.listdir(inDir)
 
