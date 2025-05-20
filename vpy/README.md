@@ -1,0 +1,1 @@
+Upscaling/encoding scripts using vs-mlrt. Download the prebuilt dll from https://github.com/AmusementClub/vs-mlrt and drag and drop video files onto encode.bat.
