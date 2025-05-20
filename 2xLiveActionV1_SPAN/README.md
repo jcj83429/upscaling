@@ -2,7 +2,7 @@
 
 **Scale:** 2
 **Architecture:** SPAN
-**Links:** https://github.com/jcj83429/upscaling/tree/main/4xLiveActionV1_SPAN
+**Links:** https://github.com/jcj83429/upscaling/tree/main/2xLiveActionV1_SPAN
 
 **Author:** jcj83429
 **License:** CC BY-NC-SA 4.0
