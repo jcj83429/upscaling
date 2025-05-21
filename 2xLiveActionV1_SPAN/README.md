@@ -37,5 +37,6 @@ Limitations:
 1. The model has limited ability to see details through heavy grain, but light to moderate grain is fine.
 2. The model still does not handle bad deinterlacing perfectly, especially if the source is vertically resized. Fixing bad deinterlacing is not the main goal so it is what it is. Sources that are line-doubled throughout should be scaled back to half height first for best results.
 3. The model sometimes oversharpens a little. This is because the training data has some oversharpened images.
+4. This model generally cannot handle VHS degradation.
 
 **Showcase:** https://slow.pics/c/DtDN7gaq
