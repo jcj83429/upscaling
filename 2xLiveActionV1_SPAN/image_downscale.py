@@ -17,7 +17,7 @@ outDirLR = os.path.join(parentDir, inDirBaseName+f'_{factorName}')
 def resizeOptions(n, inX, inY):
     options = {}
     for _ in range(n):
-        downFilter = 'Catrom'
+        downFilter = 'Spline'
         downX = inX // FACTOR // 8 * 8 # ensure multiple of 8 so it can be chroma subsampled after downscaling to 1/4
         downY = inY // FACTOR // 8 * 8
 
