@@ -15,6 +15,7 @@ FACTOR = 2
 HQ_SCALE = False
 HQ_COMP = True
 TEXT = True
+NOISE = True
 
 characters = string.ascii_letters + string.digits + string.punctuation
 # remove symbols that need escaping
@@ -353,6 +354,17 @@ def processInFile(inFile):
             minSize = 36
         textFlags = textOptions(inX, inY, minSize)
 
+    noiseType = None
+    noiseAtten = 1
+    if NOISE:
+        noiseType = random.choice(['Gaussian', 'Poisson', None, None])
+        if noiseType == 'Gaussian':
+            noiseAtten = random.randrange(2, 20) / 100 # higher = stronger
+        elif noiseType == 'Poisson':
+            noiseAtten = random.randrange(50, 100) # higher = weaker. More than 100 misbehaves
+        if noiseType is not None:
+            name = f'{name}-n{noiseType}{noiseAtten}'
+
     # there is no lossless option. high quality compressed is close enough
     # we need both jpg and asp. imagemagick's jpg leans towards mosquito noise. ffmpeg's asp encoder leans toward blocking.
     compression = random.choices(['jpg', 'asp', 'h264', 'vp9', 'h265'], [10, 15, 40, 15, 20])[0]
@@ -378,19 +390,35 @@ def processInFile(inFile):
 
     print(outBaseName)
 
+    hrNoiseFlags = []
+    lrNoiseFlags = []
+    # Noise is kind of special in that the noise patch is generated at LR resolution. This trains the model to ignore noise. Don't remove it, don't amplify it.
+    # Noise is always added after all degradations. In real videos, noise can be sharper than content.
+    if noiseType is not None:
+        noiseLayerFilePath = os.path.join(outDirHR, outBaseName+'-noiselayer.png')
+        subprocess.run(['convert', '-size', f'{inX//2}x{inY//2}', 'xc:gray', '-attenuate', str(noiseAtten), '+noise', noiseType, noiseLayerFilePath], check=True, capture_output=True)
+        lrNoiseFlags = [noiseLayerFilePath, '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite']
+        hrNoiseFlags = [ '(', noiseLayerFilePath, '-filter', 'Catrom', '-resize', f'{inX}x{inY}', ')', '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite']
+
     if textMode == 'degraded':
-        subprocess.run(['convert', inFilePath] + textFlags + [outHrFilePath], check=True, capture_output=True)
-        subprocess.run(['convert', outHrFilePath] + flags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', inFilePath] + textFlags + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', outHrFilePath] + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
     elif textMode == 'clean':
         textLayerFilePath = os.path.join(outDirHR, outBaseName+'-textlayer.png')
         subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:transparent'] + textFlags + lowPngCompressionFlags + [textLayerFilePath], check=True, capture_output=True)
-        subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite', outHrFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite'] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
         textResizeFilter = random.choice(['Box', 'Triangle', 'Catrom', 'Lanczos', 'Spline'])
-        subprocess.run(['convert', inFilePath] + flags + ['(', textLayerFilePath, '-filter', textResizeFilter, '-resize', f'{inX//FACTOR}x{inY//FACTOR}!', ')', '-composite'] + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', inFilePath] + flags + ['(', textLayerFilePath, '-filter', textResizeFilter, '-resize', f'{inX//FACTOR}x{inY//FACTOR}!', ')', '-composite'] + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
         os.remove(textLayerFilePath)
     else:
-        subprocess.run(['convert', inFilePath] + flags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
-        os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
+        subprocess.run(['convert', inFilePath] + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+        if hrNoiseFlags:
+            subprocess.run(['convert', inFilePath] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+        else:
+            os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
+
+    if noiseType is not None:
+        os.remove(noiseLayerFilePath)
 
     if compression == 'jpg':
         outTmpFilePath = outFilePath+'.jpg'
