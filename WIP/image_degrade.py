@@ -13,7 +13,6 @@ import numpy as np
 
 FACTOR = 2
 HQ_SCALE = False
-HQ_COMP = True
 TEXT = True
 NOISE = True
 
@@ -337,6 +336,12 @@ def processInFile(inFile):
     lowPngCompressionFlags = ['-quality', '0'] # use worse compression for temporary files to go faster
 
     name, flags = resizeOptions(inX, inY)
+
+    normalizedCompQuality = random.random() # 0 = worst, 1 = best
+    # Avoid adding noise with low quality compression. The noise will just get removed by compression
+    if NOISE:
+        normalizedCompQuality = 0.6 + normalizedCompQuality * 0.4
+
     # Insert text before or after resize/blur/sharpen
     textMode = None
     if TEXT:
@@ -356,31 +361,36 @@ def processInFile(inFile):
 
     noiseType = None
     noiseAtten = 1
+    noiseDegrade = False
     if NOISE:
-        noiseType = random.choice(['Gaussian', 'Poisson', None, None])
-        if noiseType == 'Gaussian':
-            noiseAtten = random.randrange(2, 20) / 100 # higher = stronger
-        elif noiseType == 'Poisson':
-            noiseAtten = random.randrange(50, 100) # higher = weaker. More than 100 misbehaves
+        noiseType = random.choices(['Gaussian', 'Poisson', None], [2, 2, 0])[0]
         if noiseType is not None:
+            if noiseType == 'Gaussian':
+                noiseAtten = random.randrange(20, 120) / 100 # higher = stronger
+            elif noiseType == 'Poisson':
+                noiseAtten = random.randrange(10, 60) # higher = weaker. More than 100 misbehaves
+            noiseDegrade = False #random.choice([True, False])
             name = f'{name}-n{noiseType}{noiseAtten}'
+            if noiseDegrade:
+                name += 'd'
 
     # there is no lossless option. high quality compressed is close enough
     # we need both jpg and asp. imagemagick's jpg leans towards mosquito noise. ffmpeg's asp encoder leans toward blocking.
     compression = random.choices(['jpg', 'asp', 'h264', 'vp9', 'h265'], [10, 15, 40, 15, 20])[0]
     if compression == 'jpg':
-        quality = random.randrange(70 if HQ_COMP else 60, 90)
+        qualityRange = (70, 90)
     elif compression == 'asp':
-        quality = random.randrange(1, 7 if HQ_COMP else 8)
+        qualityRange = (7, 1)
     elif compression == 'h264':
-        quality = random.randrange(16, 23 if HQ_COMP else 25)
+        qualityRange = (23, 16)
     elif compression == 'vp9':
-        quality = random.randrange(30, 45 if HQ_COMP else 50)
+        qualityRange = (45, 30)
     elif compression == 'h265':
-        quality = random.randrange(19, 26 if HQ_COMP else 28)
+        qualityRange = (26, 19)
     else:
         assert False
-    quality = str(quality)
+    quality = qualityRange[0] + normalizedCompQuality * (qualityRange[1] - qualityRange[0])
+    quality = str(int(quality))
     name += f'-{compression}-{quality}'
 
     outBaseName = baseName + '-' + name
@@ -392,17 +402,21 @@ def processInFile(inFile):
 
     hrNoiseFlags = []
     lrNoiseFlags = []
-    # Noise is kind of special in that the noise patch is generated at LR resolution. This trains the model to ignore noise. Don't remove it, don't amplify it.
-    # Noise is always added after all degradations. In real videos, noise can be sharper than content.
+    # Noise may be degraded or clean. In real videos especially film, noise can be sharper than content.
+    # Even for degraded noise, we degrade the noise separately and add it to the LR and HR at the end. We can't add it to HR first then generate degraded LR because the HR will have more noise than LR.
     if noiseType is not None:
         noiseLayerFilePath = os.path.join(outDirHR, outBaseName+'-noiselayer.png')
-        subprocess.run(['convert', '-size', f'{inX//2}x{inY//2}', 'xc:gray', '-attenuate', str(noiseAtten), '+noise', noiseType, noiseLayerFilePath], check=True, capture_output=True)
-        lrNoiseFlags = [noiseLayerFilePath, '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite']
-        hrNoiseFlags = [ '(', noiseLayerFilePath, '-filter', 'Catrom', '-resize', f'{inX}x{inY}', ')', '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite']
+        if noiseDegrade:
+            noiseDegradeFlags = flags
+        else:
+            noiseDegradeFlags = ['-resize', f'{inX//2}x{inY//2}']
+        subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:gray', '-colorspace', 'sRGB', '-attenuate', str(noiseAtten), '+noise', noiseType, noiseLayerFilePath], check=True, capture_output=True)
+        lrNoiseFlags = [ '(', noiseLayerFilePath ] + noiseDegradeFlags + [ ')' , '-compose', 'Mathematics', '-define', 'compose:args=0,2,1,-1', '-composite']
+        hrNoiseFlags = [ noiseLayerFilePath, '-compose', 'Mathematics', '-define', 'compose:args=0,0.6,1,-0.3', '-composite']
 
     if textMode == 'degraded':
         subprocess.run(['convert', inFilePath] + textFlags + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
-        subprocess.run(['convert', outHrFilePath] + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', inFilePath] + textFlags + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
     elif textMode == 'clean':
         textLayerFilePath = os.path.join(outDirHR, outBaseName+'-textlayer.png')
         subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:transparent'] + textFlags + lowPngCompressionFlags + [textLayerFilePath], check=True, capture_output=True)
@@ -433,9 +447,9 @@ def processInFile(inFile):
         os.remove(outTmpFilePath)
     elif compression == 'h264':
         outTmpFilePath = outFilePath+'.264'
-        x264tune = random.choice([[], ['-tune', 'film'], ['-tune', 'grain']])
+        x264flags = random.choice([[], ['-tune', 'film'], ['-tune', 'grain']])
         # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264tune + [ '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264flags + [ '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
     elif compression == 'h265':
@@ -444,7 +458,7 @@ def processInFile(inFile):
         x265params = 'psy-rd=5'
         if random.randrange(2) == 0:
             # Disabling sao is a popular setting. It also generates stronger artifacts
-            x265params += ',sao=0'
+            x265params += ':sao=0'
         subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-x265-params', x265params, '-pix_fmt', 'yuv420p10le', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
