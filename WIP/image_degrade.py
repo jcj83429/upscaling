@@ -340,7 +340,7 @@ def processInFile(inFile):
     normalizedCompQuality = random.random() # 0 = worst, 1 = best
     # Avoid adding noise with low quality compression. The noise will just get removed by compression
     if NOISE:
-        normalizedCompQuality = 0.6 + normalizedCompQuality * 0.4
+        normalizedCompQuality = 0.5 + normalizedCompQuality * 0.5
 
     # Insert text before or after resize/blur/sharpen
     textMode = None
@@ -360,26 +360,42 @@ def processInFile(inFile):
         textFlags = textOptions(inX, inY, minSize)
 
     noiseType = None
+    noiseRelativeStrength = 0
     noiseAtten = 1
+    noiseChStr = [1, 1, 1]
+    noiseSaturation = 100
     noiseDegrade = False
+    noiseDownFilter = None
     if NOISE:
-        noiseType = random.choices(['Gaussian', 'Poisson', None], [2, 2, 0])[0]
+        noiseType = random.choice(['Gaussian', 'Poisson', 'Laplacian'])
         if noiseType is not None:
+            noiseRelativeStrength = 0 # random.random()
             if noiseType == 'Gaussian':
-                noiseAtten = random.randrange(20, 120) / 100 # higher = stronger
+                noiseAtten = int(6 + noiseRelativeStrength * 19) / 10 # higher = stronger
+            elif noiseType == 'Laplacian':
+                noiseAtten = int(8 + noiseRelativeStrength * 27) / 10 # higher = stronger
             elif noiseType == 'Poisson':
-                noiseAtten = random.randrange(10, 60) # higher = weaker. More than 100 misbehaves
-            noiseDegrade = False #random.choice([True, False])
-            name = f'{name}-n{noiseType}{noiseAtten}'
+                noiseAtten = int(15 - noiseRelativeStrength * 13) # higher = weaker. More than 100 misbehaves
+            noiseChStr = [random.uniform(0.3, 1.0) for _ in range(3)]
+            noiseChStrAvg = sum(noiseChStr) / len(noiseChStr)
+            noiseChStr = [chStr / noiseChStrAvg for chStr in noiseChStr]
+            noiseSaturation = min(int(random.random() * 150), 100)
+            noiseDegrade = True # random.choice([True, False])
+            name = f'{name}-n{noiseType}{noiseAtten}x' + ''.join(f'{min(int(chStr*10), 15):x}' for chStr in noiseChStr) + f's{noiseSaturation}'
             if noiseDegrade:
                 name += 'd'
+            else:
+                noiseDownFilter = random.choice(['Mitchell', 'Gaussian', 'Spline', 'Triangle'])
+                name += noiseDownFilter
 
     # there is no lossless option. high quality compressed is close enough
     # we need both jpg and asp. imagemagick's jpg leans towards mosquito noise. ffmpeg's asp encoder leans toward blocking.
-    compression = random.choices(['jpg', 'asp', 'h264', 'vp9', 'h265'], [10, 15, 40, 15, 20])[0]
+    compression = random.choices(['jpg', 'asp', 'mpg', 'h264', 'vp9', 'h265'], [10, 10, 10, 35, 15, 20])[0]
     if compression == 'jpg':
         qualityRange = (70, 90)
     elif compression == 'asp':
+        qualityRange = (7, 1)
+    elif compression == 'mpg':
         qualityRange = (7, 1)
     elif compression == 'h264':
         qualityRange = (23, 16)
@@ -409,10 +425,16 @@ def processInFile(inFile):
         if noiseDegrade:
             noiseDegradeFlags = flags
         else:
-            noiseDegradeFlags = ['-resize', f'{inX//2}x{inY//2}']
-        subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:gray', '-colorspace', 'sRGB', '-attenuate', str(noiseAtten), '+noise', noiseType, noiseLayerFilePath], check=True, capture_output=True)
-        lrNoiseFlags = [ '(', noiseLayerFilePath ] + noiseDegradeFlags + [ ')' , '-compose', 'Mathematics', '-define', 'compose:args=0,2,1,-1', '-composite']
-        hrNoiseFlags = [ noiseLayerFilePath, '-compose', 'Mathematics', '-define', 'compose:args=0,0.6,1,-0.3', '-composite']
+            noiseDegradeFlags = ['-filter', noiseDownFilter, '-resize', f'{inX//2}x{inY//2}']
+        subprocess.run(['convert', inFilePath, '-depth', '16', '-duplicate', '1', # stack: HR1, HR2
+                        '-attenuate', str(noiseAtten), '+noise', noiseType, # add noise to HR2
+                        '-compose', 'Mathematics', '-define', 'compose:args=0,1,-1,0.5', '-composite', # noise = HR2 - HR1 + 0.5
+                        '-color-matrix', f'6x3: {noiseChStr[0]} 0 0 0 0 {0.5*(1-noiseChStr[0])}  0 {noiseChStr[1]} 0 0 0 {0.5*(1-noiseChStr[1])}  0 0 {noiseChStr[2]} 0 0 {0.5*(1-noiseChStr[2])}',
+                        '-modulate', f'100,{noiseSaturation}',
+                        noiseLayerFilePath], check=True, capture_output=True)
+        lrNoiseFlags = [ '(', noiseLayerFilePath ] + noiseDegradeFlags + [ ')' , '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite']
+        hrNoiseScale = min(1.0, max(0.0, 0.5 + 1.0 * noiseRelativeStrength))
+        hrNoiseFlags = [ '(', noiseLayerFilePath, '-blur', '0x0.5', ')', '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
 
     if textMode == 'degraded':
         subprocess.run(['convert', inFilePath] + textFlags + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
@@ -445,9 +467,17 @@ def processInFile(inFile):
         subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
+    elif compression == 'mpg':
+        outTmpFilePath = outFilePath+'.mpg'
+        # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', '-vframes', '1', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        os.remove(outTmpFilePath)
     elif compression == 'h264':
         outTmpFilePath = outFilePath+'.264'
         x264flags = random.choice([[], ['-tune', 'film'], ['-tune', 'grain']])
+        # for intra, the only relevant difference is trellis 0/1/2
+        x264flags += ['-preset', random.choice(['veryfast', 'medium', 'slow'])]
         # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
         subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264flags + [ '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
