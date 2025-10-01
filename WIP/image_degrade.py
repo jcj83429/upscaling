@@ -56,7 +56,7 @@ def resizeOptions(inX, inY):
         # Downscaling with linear light expands bright areas. Downscaling with gamma light expands dark areas.
         # Neither extreme looks fully correct. Train with a mix of both to get a compromise.
         # Because box (10% probability) is always gamma, the overall mix is 63% linear 37% gamma
-        useLinearLight = random.choices([True, False], [7, 3])[0]
+        useLinearLight = random.choices([True, False], [5, 5])[0]
 
     linearLightFlags = ['-colorspace', 'RGB']
     gammaLightFlags = ['-colorspace', 'sRGB']
@@ -105,7 +105,7 @@ def resizeOptions(inX, inY):
 
             if sharpeningMode == 'unsharp':
                 radius = random.choice([1,2,3])
-                sigma = random.randrange(1, 50 - radius * 10) / 10
+                sigma = random.randrange(1, 60 - radius * 10) / 10
                 name += f'unsharp{radius}x{sigma}-'
                 flags += ['-sharpen', f'{radius}x{sigma}']
             elif sharpeningMode == 'fir':
@@ -141,6 +141,17 @@ def resizeOptions(inX, inY):
         flags += gammaLightFlags # output gamma light
 
     return name, flags
+
+def stripLinearLightFlags(flags):
+    cleanedFlags = []
+    i = 0
+    while i < len(flags):
+        if flags[i] == '-colorspace':
+            i += 2 # skip next
+        else:
+            cleanedFlags += [flags[i]]
+            i+= 1
+    return cleanedFlags
 
 # Text addition is a part of the degrade script because text may need to be added before or after degrade
 def textOptions(inX, inY, minSize):
@@ -337,11 +348,6 @@ def processInFile(inFile):
 
     name, flags = resizeOptions(inX, inY)
 
-    normalizedCompQuality = random.random() # 0 = worst, 1 = best
-    # Avoid adding noise with low quality compression. The noise will just get removed by compression
-    if NOISE:
-        normalizedCompQuality = 0.5 + normalizedCompQuality * 0.5
-
     # Insert text before or after resize/blur/sharpen
     textMode = None
     if TEXT:
@@ -367,26 +373,33 @@ def processInFile(inFile):
     noiseDegrade = False
     noiseDownFilter = None
     if NOISE:
-        noiseType = random.choice(['Gaussian', 'Poisson', 'Laplacian'])
+        noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [5, 0, 1, 0])[0]
         if noiseType is not None:
-            noiseRelativeStrength = 0 # random.random()
+            noiseRelativeStrength = random.random() # 0 = weak, 1 = strong
+            #noiseRelativeStrength = noiseRelativeStrength * noiseRelativeStrength # light noise more often
             if noiseType == 'Gaussian':
-                noiseAtten = int(6 + noiseRelativeStrength * 19) / 10 # higher = stronger
+                noiseAtten = int(3 + noiseRelativeStrength * 8) / 10 # higher = stronger
             elif noiseType == 'Laplacian':
-                noiseAtten = int(8 + noiseRelativeStrength * 27) / 10 # higher = stronger
+                noiseAtten = int(5 + noiseRelativeStrength * 12) / 10 # higher = stronger
             elif noiseType == 'Poisson':
-                noiseAtten = int(15 - noiseRelativeStrength * 13) # higher = weaker. More than 100 misbehaves
+                noiseAtten = int(1 / (1/63 + noiseRelativeStrength * (1/6 - 1/63))) # higher = weaker. More than 64 misbehaves
             noiseChStr = [random.uniform(0.3, 1.0) for _ in range(3)]
             noiseChStrAvg = sum(noiseChStr) / len(noiseChStr)
             noiseChStr = [chStr / noiseChStrAvg for chStr in noiseChStr]
             noiseSaturation = min(int(random.random() * 150), 100)
-            noiseDegrade = True # random.choice([True, False])
+            noiseDegrade = False # random.choice([True, False])
             name = f'{name}-n{noiseType}{noiseAtten}x' + ''.join(f'{min(int(chStr*10), 15):x}' for chStr in noiseChStr) + f's{noiseSaturation}'
             if noiseDegrade:
                 name += 'd'
             else:
                 noiseDownFilter = random.choice(['Mitchell', 'Gaussian', 'Spline', 'Triangle'])
                 name += noiseDownFilter
+
+    # The goal of training with anamorphic encoding is to train the model to recognize resized compression artifacts
+    anamorphicWidth = inX // FACTOR
+    if random.randrange(3) == 0:
+        anamorphicWidth = random.randrange(int(inX / FACTOR * 3 / 5), int(inX / FACTOR * 6 / 5)) // 2 * 2
+        name += f'-ana{anamorphicWidth}'
 
     # there is no lossless option. high quality compressed is close enough
     # we need both jpg and asp. imagemagick's jpg leans towards mosquito noise. ffmpeg's asp encoder leans toward blocking.
@@ -405,6 +418,12 @@ def processInFile(inFile):
         qualityRange = (26, 19)
     else:
         assert False
+
+    normalizedCompQuality = random.random() # 0 = worst, 1 = best
+    # Avoid adding noise with low quality blurry compression. The noise will just get removed by compression
+    if NOISE and compression in ['h264', 'h265', 'vp9']:
+        normalizedCompQuality = 0.5 + normalizedCompQuality * 0.5
+
     quality = qualityRange[0] + normalizedCompQuality * (qualityRange[1] - qualityRange[0])
     quality = str(int(quality))
     name += f'-{compression}-{quality}'
@@ -423,7 +442,7 @@ def processInFile(inFile):
     if noiseType is not None:
         noiseLayerFilePath = os.path.join(outDirHR, outBaseName+'-noiselayer.png')
         if noiseDegrade:
-            noiseDegradeFlags = flags
+            noiseDegradeFlags = stripLinearLightFlags(flags) # scaling in linear light changes the noise brightness too much. Always do noise degradation in gamma light.
         else:
             noiseDegradeFlags = ['-filter', noiseDownFilter, '-resize', f'{inX//2}x{inY//2}']
         subprocess.run(['convert', inFilePath, '-depth', '16', '-duplicate', '1', # stack: HR1, HR2
@@ -433,54 +452,46 @@ def processInFile(inFile):
                         '-modulate', f'100,{noiseSaturation}',
                         noiseLayerFilePath], check=True, capture_output=True)
         lrNoiseFlags = [ '(', noiseLayerFilePath ] + noiseDegradeFlags + [ ')' , '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite']
-        hrNoiseScale = min(1.0, max(0.0, 0.5 + 1.0 * noiseRelativeStrength))
-        hrNoiseFlags = [ '(', noiseLayerFilePath, '-blur', '0x0.5', ')', '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
 
     if textMode == 'degraded':
-        subprocess.run(['convert', inFilePath] + textFlags + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
         subprocess.run(['convert', inFilePath] + textFlags + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
     elif textMode == 'clean':
         textLayerFilePath = os.path.join(outDirHR, outBaseName+'-textlayer.png')
         subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:transparent'] + textFlags + lowPngCompressionFlags + [textLayerFilePath], check=True, capture_output=True)
-        subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite'] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
         textResizeFilter = random.choice(['Box', 'Triangle', 'Catrom', 'Lanczos', 'Spline'])
         subprocess.run(['convert', inFilePath] + flags + ['(', textLayerFilePath, '-filter', textResizeFilter, '-resize', f'{inX//FACTOR}x{inY//FACTOR}!', ')', '-composite'] + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
-        os.remove(textLayerFilePath)
     else:
         subprocess.run(['convert', inFilePath] + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
-        if hrNoiseFlags:
-            subprocess.run(['convert', inFilePath] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
-        else:
-            os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
 
-    if noiseType is not None:
-        os.remove(noiseLayerFilePath)
+    # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
+    ffHqChromaFlags = ['-sws_flags', '+full_chroma_int+accurate_rnd']
+    # note: anamorphicWidth may be equal to inX//FACTOR, which makes these flags noop
+    # Ideally scaling to the anamorphic resolution should be done as a part of the normal degradation but the interaction with noise and text is too complex, so we do it at the end.
+    ffPreCompressionResizeFlags = ['-s', f'{anamorphicWidth}x{inY//FACTOR}']
+    ffPostCompressionResizeFlags = ['-s', f'{inX//FACTOR}x{inY//FACTOR}']
 
     if compression == 'jpg':
         outTmpFilePath = outFilePath+'.jpg'
-        subprocess.run(['convert', outLlFilePath, '-quality', quality, outTmpFilePath], check=True, capture_output=True)
-        subprocess.run(['convert', outTmpFilePath, outFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', outLlFilePath, '-resize',  f'{anamorphicWidth}x{inY//FACTOR}!', '-quality', quality, outTmpFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', outTmpFilePath, '-resize',  f'{inX//FACTOR}x{inY//FACTOR}!', outFilePath], check=True, capture_output=True)
         os.remove(outTmpFilePath)
     elif compression == 'asp':
         outTmpFilePath = outFilePath+'.avi'
-        # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
     elif compression == 'mpg':
         outTmpFilePath = outFilePath+'.mpg'
-        # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', '-vframes', '1', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-c:v', 'mpeg2video'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-c:v', 'mpeg2video', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + ['-vframes', '1', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
     elif compression == 'h264':
         outTmpFilePath = outFilePath+'.264'
         x264flags = random.choice([[], ['-tune', 'film'], ['-tune', 'grain']])
         # for intra, the only relevant difference is trellis 0/1/2
         x264flags += ['-preset', random.choice(['veryfast', 'medium', 'slow'])]
-        # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264flags + [ '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264flags + [ '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
     elif compression == 'h265':
         outTmpFilePath = outFilePath+'.265'
@@ -489,17 +500,41 @@ def processInFile(inFile):
         if random.randrange(2) == 0:
             # Disabling sao is a popular setting. It also generates stronger artifacts
             x265params += ':sao=0'
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-x265-params', x265params, '-pix_fmt', 'yuv420p10le', '-sws_flags', '+full_chroma_int+accurate_rnd', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-x265-params', x265params, '-pix_fmt', 'yuv420p10le'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
     elif compression == 'vp9':
         outTmpFilePath = outFilePath+'.webm'
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-pix_fmt', 'yuv420p', '-sws_flags', '+full_chroma_int+accurate_rnd', '-c:v', 'libvpx-vp9', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24', '-sws_flags', '+full_chroma_int+accurate_rnd', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + ['-c:v', 'libvpx-vp9', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         os.remove(outTmpFilePath)
     else:
         assert False
     os.remove(outLlFilePath)
+
+    if noiseType is not None:
+        # The amount of noise that makes it to the end is too hard to predict, so we have to measure it after compressing the image.
+        compressedLrPix = Image.open(outFilePath).convert('L').getdata()
+        noiseLrPix = Image.open(noiseLayerFilePath).resize((inX//2, inY//2)).convert('L').getdata()
+        covarianceMatrix = np.cov([noiseLrPix, compressedLrPix])
+        # subjective fudge factor to compensate for differences in scaling method, blur, and compression roughening noise.
+        hrNoiseScale = max(0.0, min(1.0, 1.7 * covarianceMatrix[0][1] / covarianceMatrix[0][0]))
+        print(hrNoiseScale)
+        hrNoiseFlags = [ '(', noiseLayerFilePath, '-blur', '0x0.55', ')', '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
+    if textMode == 'degraded':
+        subprocess.run(['convert', inFilePath] + textFlags + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+    elif textMode == 'clean':
+        subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite'] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+    else:
+        if hrNoiseFlags:
+            subprocess.run(['convert', inFilePath] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+        else:
+            os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
+
+    if textMode == 'clean':
+        os.remove(textLayerFilePath)
+    if noiseType is not None:
+        os.remove(noiseLayerFilePath)
 
 inFiles = os.listdir(inDir)
 
