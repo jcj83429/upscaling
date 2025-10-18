@@ -20,6 +20,13 @@ characters = string.ascii_letters + string.digits + string.punctuation
 # remove symbols that need escaping
 characters = characters.replace('%', '').replace('@', '').replace('\\', '')
 
+rgbToYuv = [
+    [ 0.2126,  0.7152,  0.0722 ],
+    [ -0.1146, -0.3854, 0.5 ],
+    [ 0.5,     -0.4542, -0.0458 ],
+]
+yuvToRgb = np.linalg.inv(rgbToYuv)
+
 inDir = sys.argv[1]
 parentDir, inDirBaseName = os.path.split(inDir.rstrip('/'))
 outDirLR = os.path.join(parentDir, inDirBaseName+f'_LR_{FACTOR}x_degraded')
@@ -96,18 +103,19 @@ def resizeOptions(inX, inY):
             name += f'{intermediateFilter}-{downX}x{downY}-'
             flags += ['-filter', intermediateFilter, '-resize', f'{downX}x{downY}!']
 
-        if sharpeningMode or isInterlaced:
-            # Always sharpen in gamma. Sharpening in linear light produces extremely nasty dark halos.
-            # Some real sources are actually like that but it is too extreme.
-            # Deinterlacing is assumed to be in gamma light.
-            if useLinearLight:
+        if sharpeningMode:
+            # Sharpening in linear light produces extremely nasty dark halos but some real sources are actually like that.
+            # Sharpening in gamma light produces more bright halo and less dark halo
+            # Surprisingly, using linear light sharpening all the time when using linear light scaling (45% of the time) doesn't derail the model.
+            sharpenInGamma = False
+            if useLinearLight and sharpenInGamma:
                 flags += gammaLightFlags
 
             if sharpeningMode == 'unsharp':
                 radius = random.choice([1,2,3])
                 sigma = random.randrange(1, 60 - radius * 10) / 10
                 name += f'unsharp{radius}x{sigma}-'
-                flags += ['-sharpen', f'{radius}x{sigma}']
+                sharpeningFlags = ['-sharpen', f'{radius}x{sigma}']
             elif sharpeningMode == 'fir':
                 def randFilterParams():
                     taps = random.choice([3, 5])
@@ -125,12 +133,24 @@ def resizeOptions(inX, inY):
                 kernel = vCoeffs * hCoeffs
                 kernelStr = '   '.join(','.join(f'{i:f}' for i in row) for row in kernel)
                 name += f'firsharp{hTaps}_{hFreq}_{hBoost}x{vTaps}_{vFreq}_{vBoost}-'
-                flags += ['-morphology', 'Convolve', f'{hTaps}x{vTaps}: {kernelStr}']
+                sharpeningFlags = ['-morphology', 'Convolve', f'{hTaps}x{vTaps}: {kernelStr}']
 
-            if isInterlaced:
-                name += f'{deintFilter}-'
-                flags += ['-filter', deintFilter, '-resize', f'{downX}x{downY*2}!']
+            if True:
+                # Use an edge mask to merge the sharpened copy with the original. This trains the model to fix oversharpened edges without softening the whole image.
+                # While softening the whole image is objectively accurate, it looks uninspiring.
+                flags += ['(', '+clone'] + sharpeningFlags + ['(', '+clone', '-colorspace', 'Gray', '-canny', '0x1+10%+30%', '-morphology', 'Dilate', 'Disk', '-clamp', '-blur', '0x3', ')', '-compose', 'CopyOpacity', '-composite', ')', '-compose', 'Over', '-composite']
+            else:
+                flags += sharpeningFlags
 
+            if useLinearLight and sharpenInGamma:
+                flags += linearLightFlags
+
+        # Deinterlacing is assumed to be in gamma light.
+        if isInterlaced:
+            if useLinearLight:
+                flags += gammaLightFlags
+            name += f'{deintFilter}-'
+            flags += ['-filter', deintFilter, '-resize', f'{downX}x{downY*2}!']
             if useLinearLight:
                 flags += linearLightFlags
 
@@ -373,20 +393,20 @@ def processInFile(inFile):
     noiseDegrade = False
     noiseDownFilter = None
     if NOISE:
-        noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [5, 0, 1, 0])[0]
+        noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [5, 1, 0, 0])[0]
         if noiseType is not None:
             noiseRelativeStrength = random.random() # 0 = weak, 1 = strong
-            #noiseRelativeStrength = noiseRelativeStrength * noiseRelativeStrength # light noise more often
             if noiseType == 'Gaussian':
-                noiseAtten = int(3 + noiseRelativeStrength * 8) / 10 # higher = stronger
+                noiseAtten = int(3 + noiseRelativeStrength * 11) / 10 # higher = stronger
             elif noiseType == 'Laplacian':
-                noiseAtten = int(5 + noiseRelativeStrength * 12) / 10 # higher = stronger
+                noiseAtten = int(5 + noiseRelativeStrength * 17) / 10 # higher = stronger
             elif noiseType == 'Poisson':
-                noiseAtten = int(1 / (1/63 + noiseRelativeStrength * (1/6 - 1/63))) # higher = weaker. More than 64 misbehaves
+                noiseAtten = int(1 / (1/63 + noiseRelativeStrength * (1/4 - 1/63))) # higher = weaker. More than 64 misbehaves
             noiseChStr = [random.uniform(0.3, 1.0) for _ in range(3)]
             noiseChStrAvg = sum(noiseChStr) / len(noiseChStr)
             noiseChStr = [chStr / noiseChStrAvg for chStr in noiseChStr]
-            noiseSaturation = min(int(random.random() * 150), 100)
+            # Chroma subsampling will soften chroma noise, so allow noise saturation adjustment to go over 100% to compensate
+            noiseSaturation = int(random.random() * 200)
             noiseDegrade = False # random.choice([True, False])
             name = f'{name}-n{noiseType}{noiseAtten}x' + ''.join(f'{min(int(chStr*10), 15):x}' for chStr in noiseChStr) + f's{noiseSaturation}'
             if noiseDegrade:
@@ -420,11 +440,15 @@ def processInFile(inFile):
         assert False
 
     normalizedCompQuality = random.random() # 0 = worst, 1 = best
-    # Avoid adding noise with low quality blurry compression. The noise will just get removed by compression
-    if NOISE and compression in ['h264', 'h265', 'vp9']:
-        normalizedCompQuality = 0.5 + normalizedCompQuality * 0.5
-
     quality = qualityRange[0] + normalizedCompQuality * (qualityRange[1] - qualityRange[0])
+
+    # Avoid adding noise with low quality blurry compression. The noise will just get removed by compression
+    if noiseType:
+        if compression in ['h264', 'h265']:
+            quality -= 5
+        elif compression == 'vp9':
+            quality -= 10
+
     quality = str(int(quality))
     name += f'-{compression}-{quality}'
 
@@ -514,13 +538,38 @@ def processInFile(inFile):
 
     if noiseType is not None:
         # The amount of noise that makes it to the end is too hard to predict, so we have to measure it after compressing the image.
-        compressedLrPix = Image.open(outFilePath).convert('L').getdata()
-        noiseLrPix = Image.open(noiseLayerFilePath).resize((inX//2, inY//2)).convert('L').getdata()
-        covarianceMatrix = np.cov([noiseLrPix, compressedLrPix])
-        # subjective fudge factor to compensate for differences in scaling method, blur, and compression roughening noise.
-        hrNoiseScale = max(0.0, min(1.0, 1.7 * covarianceMatrix[0][1] / covarianceMatrix[0][0]))
-        print(hrNoiseScale)
-        hrNoiseFlags = [ '(', noiseLayerFilePath, '-blur', '0x0.55', ')', '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
+        compressedLrPix = np.array(Image.open(outFilePath).convert('RGB').getdata()).T
+        noiseLrPix = np.array(Image.open(noiseLayerFilePath).resize((inX//2, inY//2)).convert('RGB').getdata()).T
+        compressedLrYuv = rgbToYuv @ compressedLrPix
+        noiseLrYuv = rgbToYuv @ noiseLrPix
+
+        yuvScale = []
+        for channel in range(3):
+            compressedLrChan = compressedLrYuv[channel]
+            noiseLrChan = noiseLrYuv[channel]
+            covarianceMatrix = np.cov([noiseLrChan, compressedLrChan])
+            yuvScale.append(max(0.0, min(1.0, covarianceMatrix[0][1] / covarianceMatrix[0][0])))
+
+        # The color matrix must not scale Y. Y is centred at 50% while UV are centred at 0.
+        hrNoiseScale = min(1.0, yuvScale[0] * 1.2)
+        if hrNoiseScale > 0:
+            yuvScale[1] = min(1.0, yuvScale[1] * 2.0) / hrNoiseScale
+            yuvScale[2] = min(1.0, yuvScale[2] * 2.0) / hrNoiseScale
+        yuvScale[0] = 1.0
+        yuvScaleMatrix = np.identity(3) * yuvScale
+        colorMatrix = yuvToRgb @ yuvScaleMatrix @ rgbToYuv
+
+        # covarianceMatrix = np.cov([noiseLrPix, compressedLrPix])
+        # # subjective fudge factor to compensate for differences in scaling method, blur, and compression roughening noise.
+        # hrNoiseScale = max(0.0, min(1.0, 1.2 * covarianceMatrix[0][1] / covarianceMatrix[0][0]))
+        print(hrNoiseScale, yuvScale)
+        # use modulate to reduce noise saturation to 75%. Compression hits chroma harder.
+        hrNoiseFlags = [ '(', noiseLayerFilePath,
+                        '-blur', '0x0.5',
+                        #'-modulate', '100,50',
+                        '-color-matrix', ' '.join(' '.join(f'{coef:.04f}' for coef in row) for row in colorMatrix),
+                        ')',
+                        '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
     if textMode == 'degraded':
         subprocess.run(['convert', inFilePath] + textFlags + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
     elif textMode == 'clean':
@@ -537,6 +586,9 @@ def processInFile(inFile):
         os.remove(noiseLayerFilePath)
 
 inFiles = os.listdir(inDir)
+
+# for inFile in inFiles:
+#     processInFile(inFile)
 
 with multiprocessing.pool.ThreadPool(24) as threadPool:
 #    threadPool.map(processInFile, inFiles)
