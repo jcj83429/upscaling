@@ -15,6 +15,10 @@ FACTOR = 2
 HQ_SCALE = False
 TEXT = True
 NOISE = True
+# Mix 2 random degradations together by merging with a mask. This has 2 purposes
+# 1. to simulate adaptive deinterlacing affecting only part of the picture
+# 2. to train model to remove out of focus blur
+MIXED_DEGRADATION = True
 
 characters = string.ascii_letters + string.digits + string.punctuation
 # remove symbols that need escaping
@@ -63,7 +67,7 @@ def resizeOptions(inX, inY):
         # Downscaling with linear light expands bright areas. Downscaling with gamma light expands dark areas.
         # Neither extreme looks fully correct. Train with a mix of both to get a compromise.
         # Because box (10% probability) is always gamma, the overall mix is 63% linear 37% gamma
-        useLinearLight = random.choices([True, False], [5, 5])[0]
+        useLinearLight = random.choices([True, False], [7, 3])[0]
 
     linearLightFlags = ['-colorspace', 'RGB']
     gammaLightFlags = ['-colorspace', 'sRGB']
@@ -107,7 +111,7 @@ def resizeOptions(inX, inY):
             # Sharpening in linear light produces extremely nasty dark halos but some real sources are actually like that.
             # Sharpening in gamma light produces more bright halo and less dark halo
             # Surprisingly, using linear light sharpening all the time when using linear light scaling (45% of the time) doesn't derail the model.
-            sharpenInGamma = False
+            sharpenInGamma = True
             if useLinearLight and sharpenInGamma:
                 flags += gammaLightFlags
 
@@ -161,6 +165,16 @@ def resizeOptions(inX, inY):
         flags += gammaLightFlags # output gamma light
 
     return name, flags
+
+def mixFlags(inX, inY, flags1, flags2):
+    #-alpha off '(' -clone -1 -resize 256x256 -resize 512x512 ')' '(' -clone -2 -flip '(' -size 512x512 xc:black -fill white -draw 'translate 200,200 circle 0,0 100,0' -alpha off ')' -compose CopyOpacity -composite ')' -delete -3 -compose Over -composite
+    outX = inX // FACTOR
+    outY = inY // FACTOR
+    circleX = random.randrange(0, outX)
+    circleY = random.randrange(0, outY)
+    circleRadius = random.randrange((outX + outY) // 8, (outX + outY) // 4)
+    mergeMaskFlags = ['(', '-size', f'{outX}x{outY}', 'xc:black', '-fill', 'white', '-draw', f'translate {circleX},{circleY} circle 0,0 {circleRadius},0', '-blur', '0x2', '-alpha', 'off', ')']
+    return ['-alpha', 'off', '(', '-clone', '-1'] + flags1 + [')', '(', '-clone', '-2'] + flags2 + mergeMaskFlags + ['-compose', 'CopyOpacity', '-composite', ')', '-delete', '-3', '-compose', 'Over', '-composite']
 
 def stripLinearLightFlags(flags):
     cleanedFlags = []
@@ -368,6 +382,12 @@ def processInFile(inFile):
 
     name, flags = resizeOptions(inX, inY)
 
+    if MIXED_DEGRADATION:
+        if True: # The effect is mild, so it can be on all the time
+            name2, flags2 = resizeOptions(inX, inY)
+            flags = mixFlags(inX, inY, flags, flags2)
+            name = name + '-MIX-' + name2
+
     # Insert text before or after resize/blur/sharpen
     textMode = None
     if TEXT:
@@ -393,26 +413,28 @@ def processInFile(inFile):
     noiseDegrade = False
     noiseDownFilter = None
     if NOISE:
-        noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [5, 1, 0, 0])[0]
+        noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [30, 1, 1, 0])[0]
         if noiseType is not None:
             noiseRelativeStrength = random.random() # 0 = weak, 1 = strong
             if noiseType == 'Gaussian':
-                noiseAtten = int(3 + noiseRelativeStrength * 11) / 10 # higher = stronger
+                noiseAtten = int(3 + noiseRelativeStrength * 17) / 10 # higher = stronger
             elif noiseType == 'Laplacian':
-                noiseAtten = int(5 + noiseRelativeStrength * 17) / 10 # higher = stronger
+                noiseAtten = int(5 + noiseRelativeStrength * 25) / 10 # higher = stronger
             elif noiseType == 'Poisson':
-                noiseAtten = int(1 / (1/63 + noiseRelativeStrength * (1/4 - 1/63))) # higher = weaker. More than 64 misbehaves
-            noiseChStr = [random.uniform(0.3, 1.0) for _ in range(3)]
+                noiseAtten = int(1 / (1/63 + noiseRelativeStrength * (1/2 - 1/63))) # higher = weaker. More than 64 misbehaves
+            noiseChStr= []
+            while sum(noiseChStr) <= 0:
+                noiseChStr = [max(0.0, random.uniform(-0.2, 1.0)) for _ in range(3)]
             noiseChStrAvg = sum(noiseChStr) / len(noiseChStr)
             noiseChStr = [chStr / noiseChStrAvg for chStr in noiseChStr]
             # Chroma subsampling will soften chroma noise, so allow noise saturation adjustment to go over 100% to compensate
             noiseSaturation = int(random.random() * 200)
-            noiseDegrade = False # random.choice([True, False])
+            noiseDegrade = True # random.choice([True, False])
             name = f'{name}-n{noiseType}{noiseAtten}x' + ''.join(f'{min(int(chStr*10), 15):x}' for chStr in noiseChStr) + f's{noiseSaturation}'
             if noiseDegrade:
                 name += 'd'
             else:
-                noiseDownFilter = random.choice(['Mitchell', 'Gaussian', 'Spline', 'Triangle'])
+                noiseDownFilter = random.choice(['Mitchell', 'Catrom', 'Lanczos', 'Gaussian', 'Spline', 'Triangle'])
                 name += noiseDownFilter
 
     # The goal of training with anamorphic encoding is to train the model to recognize resized compression artifacts
@@ -431,23 +453,16 @@ def processInFile(inFile):
     elif compression == 'mpg':
         qualityRange = (7, 1)
     elif compression == 'h264':
-        qualityRange = (23, 16)
+        qualityRange = (26, 14) if noiseType else (23, 16)
     elif compression == 'vp9':
-        qualityRange = (45, 30)
+        qualityRange = (50, 25) if noiseType else (45, 30)
     elif compression == 'h265':
-        qualityRange = (26, 19)
+        qualityRange = (30, 17) if noiseType else (26, 19)
     else:
         assert False
 
     normalizedCompQuality = random.random() # 0 = worst, 1 = best
     quality = qualityRange[0] + normalizedCompQuality * (qualityRange[1] - qualityRange[0])
-
-    # Avoid adding noise with low quality blurry compression. The noise will just get removed by compression
-    if noiseType:
-        if compression in ['h264', 'h265']:
-            quality -= 5
-        elif compression == 'vp9':
-            quality -= 10
 
     quality = str(int(quality))
     name += f'-{compression}-{quality}'
@@ -466,7 +481,9 @@ def processInFile(inFile):
     if noiseType is not None:
         noiseLayerFilePath = os.path.join(outDirHR, outBaseName+'-noiselayer.png')
         if noiseDegrade:
-            noiseDegradeFlags = stripLinearLightFlags(flags) # scaling in linear light changes the noise brightness too much. Always do noise degradation in gamma light.
+            # scaling in linear light changes the noise brightness too much. Always do noise degradation in gamma light.
+            # Don't use mixed degradation for noise. With mixed noise degradation it is impossible to match HR and LR noise amount.
+            noiseDegradeFlags = stripLinearLightFlags(flags2 if MIXED_DEGRADATION else flags)
         else:
             noiseDegradeFlags = ['-filter', noiseDownFilter, '-resize', f'{inX//2}x{inY//2}']
         subprocess.run(['convert', inFilePath, '-depth', '16', '-duplicate', '1', # stack: HR1, HR2
@@ -511,7 +528,9 @@ def processInFile(inFile):
         os.remove(outTmpFilePath)
     elif compression == 'h264':
         outTmpFilePath = outFilePath+'.264'
-        x264flags = random.choice([[], ['-tune', 'film'], ['-tune', 'grain']])
+        x264flags = []
+        #x264flags += ['-psy-rd', '2']
+        x264flags += random.choice([[], ['-tune', 'film'], ['-tune', 'grain'], ['-tune', 'grain', '-deblock', '-3:-3']])
         # for intra, the only relevant difference is trellis 0/1/2
         x264flags += ['-preset', random.choice(['veryfast', 'medium', 'slow'])]
         subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264flags + [ '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
@@ -551,10 +570,10 @@ def processInFile(inFile):
             yuvScale.append(max(0.0, min(1.0, covarianceMatrix[0][1] / covarianceMatrix[0][0])))
 
         # The color matrix must not scale Y. Y is centred at 50% while UV are centred at 0.
-        hrNoiseScale = min(1.0, yuvScale[0] * 1.2)
+        hrNoiseScale = 0 # min(2.0, yuvScale[0] * 1.2)
         if hrNoiseScale > 0:
-            yuvScale[1] = min(1.0, yuvScale[1] * 2.0) / hrNoiseScale
-            yuvScale[2] = min(1.0, yuvScale[2] * 2.0) / hrNoiseScale
+            yuvScale[1] = min(1.0, yuvScale[1] * 1.6) / hrNoiseScale
+            yuvScale[2] = min(1.0, yuvScale[2] * 1.6) / hrNoiseScale
         yuvScale[0] = 1.0
         yuvScaleMatrix = np.identity(3) * yuvScale
         colorMatrix = yuvToRgb @ yuvScaleMatrix @ rgbToYuv
@@ -563,11 +582,9 @@ def processInFile(inFile):
         # # subjective fudge factor to compensate for differences in scaling method, blur, and compression roughening noise.
         # hrNoiseScale = max(0.0, min(1.0, 1.2 * covarianceMatrix[0][1] / covarianceMatrix[0][0]))
         print(hrNoiseScale, yuvScale)
-        # use modulate to reduce noise saturation to 75%. Compression hits chroma harder.
         hrNoiseFlags = [ '(', noiseLayerFilePath,
                         '-blur', '0x0.5',
-                        #'-modulate', '100,50',
-                        '-color-matrix', ' '.join(' '.join(f'{coef:.04f}' for coef in row) for row in colorMatrix),
+                       # '-color-matrix', ' '.join(' '.join(f'{coef:.04f}' for coef in row) for row in colorMatrix),
                         ')',
                         '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
     if textMode == 'degraded':
