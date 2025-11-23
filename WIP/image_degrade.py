@@ -10,11 +10,15 @@ import tqdm
 import string
 from scipy import signal
 import numpy as np
+import cv2
 
 FACTOR = 2
+FACTOR_LOG = 1
 HQ_SCALE = False
 TEXT = True
 NOISE = True
+NOISE_FRAMES = 10
+NOISE_REPEAT = 3
 # Mix 2 random degradations together by merging with a mask. This has 2 purposes
 # 1. to simulate adaptive deinterlacing affecting only part of the picture
 # 2. to train model to remove out of focus blur
@@ -346,12 +350,12 @@ def textOptions(inX, inY, minSize):
         underColorStr = randomColorStr()
     # elif styleNum < 9:
     #     textColorStr = white
-    # elif styleNum < 14:
+    # elif styleNum < 10:
     #     textColorStr = 'white'
     #     borderColorStr = 'black'
-    # elif styleNum < 15:
-    #     textColorStr = randomColorStr(True)
-    #     borderColorStr = 'black'
+    elif styleNum < 15:
+        textColorStr = randomColorStr(True)
+        borderColorStr = 'black'
     # elif styleNum < 16:
     #     textColorStr = 'white'
     #     borderColorStr = randomColorStr(False)
@@ -413,7 +417,7 @@ def processInFile(inFile):
     noiseDegrade = False
     noiseDownFilter = None
     if NOISE:
-        noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [30, 1, 1, 0])[0]
+        noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [38, 1, 1, 0])[0]
         if noiseType is not None:
             noiseRelativeStrength = random.random() # 0 = weak, 1 = strong
             if noiseType == 'Gaussian':
@@ -444,20 +448,17 @@ def processInFile(inFile):
         name += f'-ana{anamorphicWidth}'
 
     # there is no lossless option. high quality compressed is close enough
-    # we need both jpg and asp. imagemagick's jpg leans towards mosquito noise. ffmpeg's asp encoder leans toward blocking.
-    compression = random.choices(['jpg', 'asp', 'mpg', 'h264', 'vp9', 'h265'], [10, 10, 10, 35, 15, 20])[0]
-    if compression == 'jpg':
-        qualityRange = (70, 90)
-    elif compression == 'asp':
+    compression = random.choices(['asp', 'mpg', 'h264', 'vp9', 'h265'], [15, 15, 35, 15, 20])[0]
+    if compression == 'asp':
         qualityRange = (7, 1)
     elif compression == 'mpg':
         qualityRange = (7, 1)
     elif compression == 'h264':
-        qualityRange = (26, 14) if noiseType else (23, 16)
+        qualityRange = (25, 14) if noiseType else (23, 16)
     elif compression == 'vp9':
-        qualityRange = (50, 25) if noiseType else (45, 30)
+        qualityRange = (40, 25) if noiseType else (45, 30) # at low quality levels vp9 turns noise into horrific DCT artifacts
     elif compression == 'h265':
-        qualityRange = (30, 17) if noiseType else (26, 19)
+        qualityRange = (28, 17) if noiseType else (26, 19)
     else:
         assert False
 
@@ -472,14 +473,26 @@ def processInFile(inFile):
     outLlFilePath = os.path.join(outDirLR, outBaseName+'.ll.png')
     outHrFilePath = os.path.join(outDirHR, outBaseName+'.png')
 
+    tempFiles = [outLlFilePath]
+
     #print(outBaseName)
 
-    hrNoiseFlags = []
-    lrNoiseFlags = []
+    if textMode == 'degraded':
+        subprocess.run(['convert', inFilePath] + textFlags + flags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+    elif textMode == 'clean':
+        textLayerFilePath = os.path.join(outDirHR, outBaseName+'-textlayer.png')
+        tempFiles += [textLayerFilePath]
+        subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:transparent'] + textFlags + lowPngCompressionFlags + [textLayerFilePath], check=True, capture_output=True)
+        textResizeFilter = random.choice(['Box', 'Triangle', 'Catrom', 'Lanczos', 'Spline'])
+        subprocess.run(['convert', inFilePath] + flags + ['(', textLayerFilePath, '-filter', textResizeFilter, '-resize', f'{inX//FACTOR}x{inY//FACTOR}!', ')', '-composite'] + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+    else:
+        subprocess.run(['convert', inFilePath] + flags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+
+    ffmpegInputFile = outLlFilePath
+    ffmpegOutputFile = outFilePath
     # Noise may be degraded or clean. In real videos especially film, noise can be sharper than content.
     # Even for degraded noise, we degrade the noise separately and add it to the LR and HR at the end. We can't add it to HR first then generate degraded LR because the HR will have more noise than LR.
     if noiseType is not None:
-        noiseLayerFilePath = os.path.join(outDirHR, outBaseName+'-noiselayer.png')
         if noiseDegrade:
             # scaling in linear light changes the noise brightness too much. Always do noise degradation in gamma light.
             # Don't use mixed degradation for noise. With mixed noise degradation it is impossible to match HR and LR noise amount.
@@ -490,23 +503,37 @@ def processInFile(inFile):
             noiseDegradeFlags = ['-filter', noiseDownFilter, '-resize', f'{inX//2}x{inY//2}']
         if random.randrange(2) == 0:
             noiseDegradeFlags += ['-blur', f'0x{random.randint(1, 10)/10}']
-        subprocess.run(['convert', inFilePath, '-depth', '16', '-duplicate', '1', # stack: HR1, HR2
+
+        noiseGenFlags = ['-duplicate', '1', # stack: HR1, HR2
                         '-attenuate', str(noiseAtten), '+noise', noiseType, # add noise to HR2
                         '-compose', 'Mathematics', '-define', 'compose:args=0,1,-1,0.5', '-composite', # noise = HR2 - HR1 + 0.5
                         '-color-matrix', f'6x3: {noiseChStr[0]} 0 0 0 0 {0.5*(1-noiseChStr[0])}  0 {noiseChStr[1]} 0 0 0 {0.5*(1-noiseChStr[1])}  0 0 {noiseChStr[2]} 0 0 {0.5*(1-noiseChStr[2])}',
-                        '-modulate', f'100,{noiseSaturation}',
-                        noiseLayerFilePath], check=True, capture_output=True)
-        lrNoiseFlags = [ '(', noiseLayerFilePath ] + noiseDegradeFlags + [ ')' , '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite']
+                        '-modulate', f'100,{noiseSaturation}']
 
-    if textMode == 'degraded':
-        subprocess.run(['convert', inFilePath] + textFlags + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
-    elif textMode == 'clean':
-        textLayerFilePath = os.path.join(outDirHR, outBaseName+'-textlayer.png')
-        subprocess.run(['convert', '-size', f'{inX}x{inY}', 'xc:transparent'] + textFlags + lowPngCompressionFlags + [textLayerFilePath], check=True, capture_output=True)
-        textResizeFilter = random.choice(['Box', 'Triangle', 'Catrom', 'Lanczos', 'Spline'])
-        subprocess.run(['convert', inFilePath] + flags + ['(', textLayerFilePath, '-filter', textResizeFilter, '-resize', f'{inX//FACTOR}x{inY//FACTOR}!', ')', '-composite'] + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
-    else:
-        subprocess.run(['convert', inFilePath] + flags + lrNoiseFlags + lowPngCompressionFlags + [outLlFilePath], check=True, capture_output=True)
+        allNoiseGenFlags = []
+        allLrFramesFlags = []
+        # Simulate both I frame and P frame compression
+        noiseFrames = NOISE_FRAMES # random.choice([1, NOISE_FRAMES])
+        noiseRepeat = NOISE_REPEAT if noiseFrames > 1 else 1
+        for i in range(noiseFrames):
+            noiseFrameFilePath = os.path.join(outDirHR, outBaseName+f'-noiselayer{i}.png')
+            lrFrameFilePath = os.path.join(outDirLR, outBaseName+f'-ll{i}.png')
+            tempFiles += [noiseFrameFilePath, lrFrameFilePath]
+            allNoiseGenFlags += ['(', '+clone'] + noiseGenFlags + ['-write', noiseFrameFilePath, '+delete', ')']
+            allLrFramesFlags += ['(', '+clone', '(', noiseFrameFilePath ] + noiseDegradeFlags + [ ')' , '-compose', 'Mathematics', '-define', 'compose:args=0,1,1,-0.5', '-composite', '-write', lrFrameFilePath, '+delete', ')']
+
+        subprocess.run(['convert', inFilePath, '-depth', '16'] + lowPngCompressionFlags + allNoiseGenFlags + ['/dev/null'], check=True, capture_output=True)
+        subprocess.run(['convert', outLlFilePath] + lowPngCompressionFlags + allLrFramesFlags + ['/dev/null'], check=True, capture_output=True)
+        for rep in range(1, noiseRepeat):
+            for i in range(noiseFrames):
+                srcFile = outBaseName+f'-ll{i}.png'
+                dstFile = os.path.join(outDirLR, outBaseName+f'-ll{i + rep * noiseFrames}.png')
+                os.symlink(srcFile, dstFile)
+                tempFiles += [dstFile]
+        for i in range(noiseFrames * noiseRepeat):
+            tempFiles += [os.path.join(outDirLR, outBaseName+f'-{i+1}.png')] # output starts at 1
+        ffmpegInputFile = os.path.join(outDirLR, outBaseName+'-ll%d.png')
+        ffmpegOutputFile = os.path.join(outDirLR, outBaseName+'-%d.png')
 
     # full_chroma_int+accurate_rnd is needed for good quality chroma subsampling, especially from 8 bit yuv420p. ffmpeg's default is quite poor.
     ffHqChromaFlags = ['-sws_flags', '+full_chroma_int+accurate_rnd']
@@ -515,101 +542,152 @@ def processInFile(inFile):
     ffPreCompressionResizeFlags = ['-s', f'{anamorphicWidth}x{inY//FACTOR}']
     ffPostCompressionResizeFlags = ['-s', f'{inX//FACTOR}x{inY//FACTOR}']
 
-    if compression == 'jpg':
-        outTmpFilePath = outFilePath+'.jpg'
-        subprocess.run(['convert', outLlFilePath, '-resize',  f'{anamorphicWidth}x{inY//FACTOR}!', '-quality', quality, outTmpFilePath], check=True, capture_output=True)
-        subprocess.run(['convert', outTmpFilePath, '-resize',  f'{inX//FACTOR}x{inY//FACTOR}!', outFilePath], check=True, capture_output=True)
-        os.remove(outTmpFilePath)
-    elif compression == 'asp':
+    if compression == 'asp':
         outTmpFilePath = outFilePath+'.avi'
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        os.remove(outTmpFilePath)
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile, '-q', quality, '-g', '1000', '-keyint_min', '1000', '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        tempFiles += [outTmpFilePath]
     elif compression == 'mpg':
         outTmpFilePath = outFilePath+'.mpg'
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-q', quality, '-pix_fmt', 'yuv420p', '-c:v', 'mpeg2video'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-c:v', 'mpeg2video', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + ['-vframes', '1', outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        os.remove(outTmpFilePath)
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile, '-q', quality, '-g', '1000', '-keyint_min', '1000', '-pix_fmt', 'yuv420p', '-c:v', 'mpeg2video'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        overwriteFlags = ['-update', '1'] if '%d' not in ffmpegOutputFile else []
+        subprocess.run(['ffmpeg', '-c:v', 'mpeg2video', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + overwriteFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        tempFiles += [outTmpFilePath]
     elif compression == 'h264':
-        outTmpFilePath = outFilePath+'.264'
-        x264flags = []
-        #x264flags += ['-psy-rd', '2']
+        outTmpFilePath = outFilePath+'.mkv'
+        x264flags = ['-g', '1000', '-keyint_min', '1000']
         x264flags += random.choice([[], ['-tune', 'film'], ['-tune', 'grain'], ['-tune', 'grain', '-deblock', '-3:-3']])
-        # for intra, the only relevant difference is trellis 0/1/2
-        x264flags += ['-preset', random.choice(['veryfast', 'medium', 'slow'])]
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality] + x264flags + [ '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        os.remove(outTmpFilePath)
+        x264flags += ['-preset', random.choice(['fast', 'medium', 'slow', 'slower'])]
+        x264flags += random.choice([[], ['-mbtree', '0']])
+        x264flags += ['-aq-strength', str(random.randint(7, 13) / 10)]
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile, '-c:v', 'libx264', '-crf', quality] + x264flags + [ '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        tempFiles += [outTmpFilePath]
     elif compression == 'h265':
-        outTmpFilePath = outFilePath+'.265'
-        # x265 uses ~40% psy-rd strength for I frames. See source/encoder/rdcost.h. To get more typical distortions (microbanding) seen on P/B frames, increase psyRd from default 2 to 5.
-        x265params = 'psy-rd=5'
+        outTmpFilePath = outFilePath+'.mkv'
+        x265Preset = random.choice(['medium', 'slow'])
+        x265params = f'keyint=1000:min-keyint=1000:preset={x265Preset}'
         if random.randrange(2) == 0:
             # Disabling sao is a popular setting. It also generates stronger artifacts
             x265params += ':sao=0'
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-x265-params', x265params, '-pix_fmt', 'yuv420p10le'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        os.remove(outTmpFilePath)
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile, '-c:v', 'libx265', '-crf', quality, '-x265-params', x265params, '-pix_fmt', 'yuv420p10le'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        tempFiles += [outTmpFilePath]
     elif compression == 'vp9':
         outTmpFilePath = outFilePath+'.webm'
-        subprocess.run(['ffmpeg', '-i', outLlFilePath, '-crf', quality, '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + ['-c:v', 'libvpx-vp9', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [outFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
-        os.remove(outTmpFilePath)
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile, '-crf', quality, '-g', '1000', '-keyint_min', '1000','-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + ['-c:v', 'libvpx-vp9', outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        tempFiles += [outTmpFilePath]
     else:
         assert False
-    os.remove(outLlFilePath)
 
-    if noiseType is not None:
-        # The amount of noise that makes it to the end is too hard to predict, so we have to measure it after compressing the image.
-        compressedLrPix = np.array(Image.open(outFilePath).convert('RGB').getdata()).T
-        noiseLrPix = np.array(Image.open(noiseLayerFilePath).resize((inX//2, inY//2)).convert('RGB').getdata()).T
-        compressedLrYuv = rgbToYuv @ compressedLrPix
-        noiseLrYuv = rgbToYuv @ noiseLrPix
-
-        yuvScale = []
-        for channel in range(3):
-            compressedLrChan = compressedLrYuv[channel]
-            noiseLrChan = noiseLrYuv[channel]
-            covarianceMatrix = np.cov([noiseLrChan, compressedLrChan])
-            yuvScale.append(max(0.0, covarianceMatrix[0][1] / covarianceMatrix[0][0]))
-
-        # The color matrix must not scale Y. Y is centred at 50% while UV are centred at 0.
-        hrNoiseScale = min(3.0, yuvScale[0] * 1.3)
-        if hrNoiseScale > 0:
-            yuvScale[1] = min(1.0, yuvScale[1] * 1.6) / hrNoiseScale
-            yuvScale[2] = min(1.0, yuvScale[2] * 1.6) / hrNoiseScale
-        yuvScale[0] = 1.0
-        yuvScaleMatrix = np.identity(3) * yuvScale
-        colorMatrix = yuvToRgb @ yuvScaleMatrix @ rgbToYuv
-
-        # covarianceMatrix = np.cov([noiseLrPix, compressedLrPix])
-        # # subjective fudge factor to compensate for differences in scaling method, blur, and compression roughening noise.
-        # hrNoiseScale = max(0.0, min(1.0, 1.2 * covarianceMatrix[0][1] / covarianceMatrix[0][0]))
-        print(hrNoiseScale, yuvScale)
-        hrNoiseFlags = [ '(', noiseLayerFilePath,
-                        '-blur', '0x0.5',
-                       # '-color-matrix', ' '.join(' '.join(f'{coef:.04f}' for coef in row) for row in colorMatrix),
-                        ')',
-                        '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
     if textMode == 'degraded':
-        subprocess.run(['convert', inFilePath] + textFlags + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', inFilePath] + textFlags + [outHrFilePath], check=True, capture_output=True)
     elif textMode == 'clean':
-        subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite'] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+        subprocess.run(['convert', inFilePath, textLayerFilePath, '-composite'] + [outHrFilePath], check=True, capture_output=True)
     else:
-        if hrNoiseFlags:
-            subprocess.run(['convert', inFilePath] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
-        else:
-            os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
+        subprocess.run(['cp', inFilePath, outHrFilePath])
 
-    if textMode == 'clean':
-        os.remove(textLayerFilePath)
     if noiseType is not None:
-        os.remove(noiseLayerFilePath)
+        noiseFrameToUse = random.randrange(0, noiseFrames * noiseRepeat)
+        noiseLayerFilePath = os.path.join(outDirHR, outBaseName+f'-noiselayer{noiseFrameToUse%noiseFrames}.png')
+        lrFrameFilePath = os.path.join(outDirLR, outBaseName+f'-{noiseFrameToUse+1}.png')
+        os.rename(lrFrameFilePath, outFilePath)
+        tempFiles.remove(lrFrameFilePath)
+        # The amount of noise that makes it to the end is too hard to predict, so we have to measure it after compressing the image.
+        # compressedLrPix = np.array(Image.open(outFilePath).convert('RGB').getdata()).T
+        # noiseLrPix = np.array(Image.open(noiseLayerFilePath).resize((inX//2, inY//2)).convert('RGB').getdata()).T
+        # compressedLrYuv = rgbToYuv @ compressedLrPix
+        # noiseLrYuv = rgbToYuv @ noiseLrPix
+        noisePix = np.float32(cv2.imread(noiseLayerFilePath, cv2.IMREAD_ANYDEPTH|cv2.IMREAD_COLOR)) * 255 / 65535
+        #noisePix = cv2.GaussianBlur(noisePix, (5, 5), 0.5)
+        #compressedLrPix = np.float32(cv2.imread(os.path.join(outDirLR, outBaseName+f'-ll9.png'), cv2.IMREAD_COLOR))
+        compressedLrPix = np.float32(cv2.imread(outFilePath, cv2.IMREAD_COLOR))
+
+        noiseBlurred = [cv2.GaussianBlur(noisePix, (int(1 + 4 * (2**i)), int(1 + 4 * (2**i))), 2**i) for i in range(-1 + FACTOR_LOG, 3 + FACTOR_LOG)]
+        compressedLrBlurred = [cv2.GaussianBlur(compressedLrPix, (int(1 + 4 * (2**i)), int(1 + 4 * (2**i))), 2**i) for i in range(-1, 3)]
+        noiseDog = [noisePix - noiseBlurred[0]]
+        noiseDogLr = []
+        compressedLrDog = [compressedLrPix - compressedLrBlurred[0]]
+        for i in range(len(noiseBlurred) - 1):
+            noiseDog += [noiseBlurred[i] - noiseBlurred[i+1]]
+            compressedLrDog += [compressedLrBlurred[i] - compressedLrBlurred[i+1]]
+        for i in range(len(noiseDog)):
+            noiseDogLr += [cv2.resize(noiseDog[i], (inX//FACTOR, inY//FACTOR))]
+
+        noiseMatchedByDog = noisePix * 0 # same shape as noisePix but all 0
+        yuvScaleDog = []
+        for dogLevel in reversed(range(len(noiseDog))):
+            noiseLrLevelYuv = cv2.cvtColor(noiseDogLr[dogLevel], cv2.COLOR_BGR2YUV)
+            compressedLrLevelYuv = cv2.cvtColor(compressedLrDog[dogLevel], cv2.COLOR_BGR2YUV)
+            yuvScaleDogLevel = []
+            for channel in range(3):
+                noiseLrLevelChan = noiseLrLevelYuv[:,:,channel]
+                compressedLrLevelChan = compressedLrLevelYuv[:,:,channel]
+                covarianceMatrix = np.cov([noiseLrLevelChan.reshape(inX//FACTOR * inY//FACTOR), compressedLrLevelChan.reshape(inX//FACTOR * inY//FACTOR)])
+                yuvScaleDogLevel.append(max(0.0, covarianceMatrix[0][1] / covarianceMatrix[0][0]))
+                # debug
+                # if channel == 0:
+                #     for i in range(len(noiseLrLevelChan)): cv2.imwrite(f'{noiseLayerFilePath}-dog{dogLevel}.png', np.uint8(noiseLrLevelChan)+128)
+                #     for i in range(len(compressedLrLevelChan)): cv2.imwrite(f'{outFilePath}-dog{dogLevel}.png', np.uint8(compressedLrLevelChan)+128)
+            if yuvScaleDog:
+                yuvScaleDogLevel[0] = max(yuvScaleDogLevel[0], yuvScaleDog[-1][0] * 0.8) # limit spectrum decay rate
+            noiseMatchedByDog += noiseDog[dogLevel] * min(3.0, yuvScaleDogLevel[0] * 1.5)
+            yuvScaleDog += [yuvScaleDogLevel]
+        # cv2.imwrite(f'{noiseLayerFilePath}-dogmatch.png', np.uint8(noiseMatchedByDog)+128)
+
+        hrPix = np.float32(cv2.imread(outHrFilePath, cv2.IMREAD_COLOR))
+        hrPix += noiseMatchedByDog
+        cv2.imwrite(outHrFilePath, np.uint8(np.clip(hrPix, 0, 255)))
+
+        # old version, doesn't do DoG decomposition
+
+        # noiseLrPix = cv2.resize(noisePix, (inX//FACTOR, inY//FACTOR))
+        # noiseLrYuv = cv2.cvtColor(noiseLrPix, cv2.COLOR_BGR2YUV)
+        # compressedLrYuv = cv2.cvtColor(compressedLrPix, cv2.COLOR_BGR2YUV)
+        # yuvScale = []
+        # for channel in range(3):
+        #     compressedLrChan = compressedLrYuv[:,:,channel]
+        #     noiseLrChan = noiseLrYuv[:,:,channel]
+        #     covarianceMatrix = np.cov([noiseLrChan.reshape(inX//FACTOR * inY//FACTOR), compressedLrChan.reshape(inX//FACTOR * inY//FACTOR)])
+        #     yuvScale.append(max(0.0, covarianceMatrix[0][1] / covarianceMatrix[0][0]))
+
+        # # The color matrix must not scale Y. Y is centred at 50% while UV are centred at 0.
+        # hrNoiseScale = min(3.0, yuvScale[0] * 1.3)
+        # if hrNoiseScale > 0:
+        #     yuvScale[1] = min(1.0, yuvScale[1] * 1.6) / hrNoiseScale
+        #     yuvScale[2] = min(1.0, yuvScale[2] * 1.6) / hrNoiseScale
+        # yuvScale[0] = 1.0
+        # yuvScaleMatrix = np.identity(3) * yuvScale
+        # colorMatrix = yuvToRgb @ yuvScaleMatrix @ rgbToYuv
+        #
+        # # covarianceMatrix = np.cov([noiseLrPix, compressedLrPix])
+        # # # subjective fudge factor to compensate for differences in scaling method, blur, and compression roughening noise.
+        # # hrNoiseScale = max(0.0, min(1.0, 1.2 * covarianceMatrix[0][1] / covarianceMatrix[0][0]))
+        # print(hrNoiseScale, yuvScale)
+        # hrNoiseFlags = [ '(', noiseLayerFilePath,
+        #                 '-blur', '0x0.5',
+        #                # '-color-matrix', ' '.join(' '.join(f'{coef:.04f}' for coef in row) for row in colorMatrix),
+        #                 ')',
+        #                 '-compose', 'Mathematics', '-define', f'compose:args=0,{hrNoiseScale},1,-{hrNoiseScale/2}', '-composite']
+
+        # if hrNoiseFlags:
+        #     subprocess.run(['convert', inFilePath] + hrNoiseFlags + [outHrFilePath], check=True, capture_output=True)
+        # else:
+        #     os.symlink(os.path.join('..', inDirBaseName, inFile), outHrFilePath)
+
+
+    for filePath in tempFiles:
+        os.remove(filePath)
 
 inFiles = os.listdir(inDir)
 
-# for inFile in inFiles:
-#     processInFile(inFile)
+# try:
+#     for inFile in inFiles:
+#         processInFile(inFile)
+# except Exception as e:
+#     pdb.post_mortem(e)
+#     exit(1)
 
 with multiprocessing.pool.ThreadPool(24) as threadPool:
 #    threadPool.map(processInFile, inFiles)
