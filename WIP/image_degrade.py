@@ -424,11 +424,11 @@ def processInFile(inFile):
                 noiseAtten = int(1 / (1/63 + noiseRelativeStrength * (1/2 - 1/63))) # higher = weaker. More than 64 misbehaves
             noiseChStr= []
             while sum(noiseChStr) <= 0:
-                noiseChStr = [max(0.0, random.uniform(-0.2, 1.0)) for _ in range(3)]
+                noiseChStr = [max(0.0, random.uniform(-1.0, 1.0)) for _ in range(3)]
             noiseChStrAvg = sum(noiseChStr) / len(noiseChStr)
             noiseChStr = [chStr / noiseChStrAvg for chStr in noiseChStr]
             # Chroma subsampling will soften chroma noise, so allow noise saturation adjustment to go over 100% to compensate
-            noiseSaturation = int(random.random() * 200)
+            noiseSaturation = int(random.random() * 150)
             noiseDegrade = True # random.choice([True, False])
             name = f'{name}-n{noiseType}{noiseAtten}x' + ''.join(f'{min(int(chStr*10), 15):x}' for chStr in noiseChStr) + f's{noiseSaturation}'
             if noiseDegrade:
@@ -472,7 +472,7 @@ def processInFile(inFile):
     outLlFilePath = os.path.join(outDirLR, outBaseName+'.ll.png')
     outHrFilePath = os.path.join(outDirHR, outBaseName+'.png')
 
-    print(outBaseName)
+    #print(outBaseName)
 
     hrNoiseFlags = []
     lrNoiseFlags = []
@@ -483,9 +483,13 @@ def processInFile(inFile):
         if noiseDegrade:
             # scaling in linear light changes the noise brightness too much. Always do noise degradation in gamma light.
             # Don't use mixed degradation for noise. With mixed noise degradation it is impossible to match HR and LR noise amount.
-            noiseDegradeFlags = stripLinearLightFlags(flags2 if MIXED_DEGRADATION else flags)
+            #noiseDegradeFlags = stripLinearLightFlags(flags2 if MIXED_DEGRADATION else flags)
+            _, noiseDegradeFlags = resizeOptions(inX, inY)
+            noiseDegradeFlags = stripLinearLightFlags(noiseDegradeFlags)
         else:
             noiseDegradeFlags = ['-filter', noiseDownFilter, '-resize', f'{inX//2}x{inY//2}']
+        if random.randrange(2) == 0:
+            noiseDegradeFlags += ['-blur', f'0x{random.randint(1, 10)/10}']
         subprocess.run(['convert', inFilePath, '-depth', '16', '-duplicate', '1', # stack: HR1, HR2
                         '-attenuate', str(noiseAtten), '+noise', noiseType, # add noise to HR2
                         '-compose', 'Mathematics', '-define', 'compose:args=0,1,-1,0.5', '-composite', # noise = HR2 - HR1 + 0.5
@@ -567,10 +571,10 @@ def processInFile(inFile):
             compressedLrChan = compressedLrYuv[channel]
             noiseLrChan = noiseLrYuv[channel]
             covarianceMatrix = np.cov([noiseLrChan, compressedLrChan])
-            yuvScale.append(max(0.0, min(1.0, covarianceMatrix[0][1] / covarianceMatrix[0][0])))
+            yuvScale.append(max(0.0, covarianceMatrix[0][1] / covarianceMatrix[0][0]))
 
         # The color matrix must not scale Y. Y is centred at 50% while UV are centred at 0.
-        hrNoiseScale = 0 # min(2.0, yuvScale[0] * 1.2)
+        hrNoiseScale = min(3.0, yuvScale[0] * 1.3)
         if hrNoiseScale > 0:
             yuvScale[1] = min(1.0, yuvScale[1] * 1.6) / hrNoiseScale
             yuvScale[2] = min(1.0, yuvScale[2] * 1.6) / hrNoiseScale
