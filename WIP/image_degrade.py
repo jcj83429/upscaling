@@ -25,7 +25,7 @@ NOISE_REPEAT = 3
 # 2. to train model to remove out of focus blur
 MIXED_DEGRADATION = True
 
-characters = string.ascii_letters + string.digits + string.punctuation
+characters = string.ascii_letters + string.digits + string.punctuation + '\t ' * 10 + '\n'
 # remove symbols that need escaping
 characters = characters.replace('%', '').replace('@', '').replace('\\', '')
 
@@ -51,7 +51,7 @@ def resizeOptions(inX, inY):
     # Although the model is focused on low quality blurry/haloey sources, if not trained with high quality sharp sources it can handle them very poorly.
     cleanDigitalDownscale = HQ_SCALE or random.randrange(2) == 0
 
-    finalFilterChoices = ['Triangle', 'Catrom', 'Lanczos', 'Spline']
+    finalFilterChoices = ['Triangle', 'Quadratic', 'Mitchell', 'Catrom', 'Spline', 'Lanczos']
     if cleanDigitalDownscale:
         # Box is less common but it produces more aliasing so it is useful to add some samples.
         # It is only used with one-step integer ratio scaling to avoid rounding weirdness.
@@ -84,7 +84,7 @@ def resizeOptions(inX, inY):
         # Electronic/digital FIR filter is more commonly seen on video, and it can achieve a level of nastiness that unsharp cannot.
         sharpeningMode = random.choices([None, 'unsharp', 'fir'], [2, 1, 1])[0]
 
-        intermediateFilter = random.choice(['Triangle', 'Catrom', 'Lanczos', 'Spline', 'Jinc'])
+        intermediateFilter = random.choice(['Triangle', 'Quadratic', 'Mitchell', 'Catrom', 'Lanczos', 'Spline', 'Jinc'])
         isInterlaced = random.randrange(5) == 0
         downX = random.randrange(outX * 3 // 5, outX * 5 // 4)
         if isInterlaced:
@@ -397,10 +397,10 @@ def processInFile(inFile):
     if textMode:
         if textMode == 'clean':
             name = f'{name}-text'
-            minSize = 24
+            minSize = 16
         else:
             name = f'text-{name}'
-            minSize = 36
+            minSize = 24
         textFlags = textOptions(inX, inY, minSize)
 
     noiseType = None
@@ -452,11 +452,11 @@ def processInFile(inFile):
     elif compression == 'mpg':
         qualityRange = (7, 1)
     elif compression == 'h264':
-        qualityRange = (23, 14) if noiseType else (23, 16)
+        qualityRange = (25, 14) if noiseType else (23, 16)
     elif compression == 'vp9':
         qualityRange = (40, 25) if noiseType else (45, 30) # at low quality levels vp9 turns noise into horrific DCT artifacts
     elif compression == 'h265':
-        qualityRange = (26, 17) if noiseType else (26, 19)
+        qualityRange = (27, 17) if noiseType else (26, 19)
     else:
         assert False
 
@@ -510,12 +510,18 @@ def processInFile(inFile):
         subprocess.run(['convert', inFilePath, '-resize', '25%', '-edge', '1', '-clamp', '-morphology', 'Dilate', 'Diamond', '-blur', '0x6', '-brightness-contrast', '30x80', '-resize', f'{inX}x{inY}', '-colorspace', 'gray'] + lowPngCompressionFlags + [noiseAlphaMaskFile], check=True, capture_output=True)
         tempFiles += [noiseAlphaMaskFile]
 
+        noiseGenAlphaMaskFlags = []
+        # Apply edge mask to noise with some probability. This trains the model to denoise less in flat areas.
+        # if random.random() < 0.7:
+        #     noiseGenAlphaMaskFlags = [noiseAlphaMaskFile, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite']
         noiseGenFlags = ['-duplicate', '1', # stack: HR1, HR2
                         '-attenuate', str(noiseAtten), '+noise', noiseType, # add noise to HR2
                         '-compose', 'Mathematics', '-define', 'compose:args=0,1,-1,0.5', '-composite', # noise = HR2 - HR1 + 0.5
                         '-color-matrix', f'6x3: {noiseChStr[0]} 0 0 0 0 {0.5*(1-noiseChStr[0])}  0 {noiseChStr[1]} 0 0 0 {0.5*(1-noiseChStr[1])}  0 0 {noiseChStr[2]} 0 0 {0.5*(1-noiseChStr[2])}',
                         '-modulate', f'100,{noiseSaturation}',
-                        noiseAlphaMaskFile, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite', '-size', f'{inX}x{inY}', 'xc:#800080008000', '+swap', '-compose', 'Over', '-composite']
+#                        '-blur', '1x0.5',
+                        ] + noiseGenAlphaMaskFlags + \
+                        ['-size', f'{inX}x{inY}', 'xc:#800080008000', '+swap', '-compose', 'Over', '-composite'] # put the noise on a grey background
 
         allNoiseGenFlags = []
         allLrFramesFlags = []
@@ -653,23 +659,39 @@ def processInFile(inFile):
                 #     for i in range(len(compressedLrLevelChan)): cv2.imwrite(f'{outFilePath}-dog{dogLevel}.png', np.uint8(compressedLrLevelChan)+128)
                 #     for i in range(len(compressedLrLevelChan)): cv2.imwrite(f'{outFilePath}-diff-dog{dogLevel}.png', np.uint8(compressedLrLevelChan - cleanLrLevelChan)+128)
             if yuvScaleDog:
-                yuvScaleDogLevel[0] = max(yuvScaleDogLevel[0], yuvScaleDog[-1][0] * 0.8) # limit spectrum decay rate
+                for channel in range(3):
+                    yuvScaleDogLevel[channel] = max(yuvScaleDogLevel[channel], yuvScaleDog[-1][channel] * 0.5) # limit spectrum decay rate
+            for channel in range(1, 3):
+                yuvScaleDogLevel[channel] = max(yuvScaleDogLevel[channel], yuvScaleDogLevel[0] * 0.5) # Subjective: increase U/V noise scale to at least half of Y noise scale
 
-            noiseMatchedByDog += noiseDog[dogLevel] * min(3.0, yuvScaleDogLevel[0] * 1.0)
+            #noiseMatchedByDog += noiseDog[dogLevel] * min(3.0, yuvScaleDogLevel[0])
+
+            noiseLevelYuv = cv2.cvtColor(noiseDog[dogLevel], cv2.COLOR_BGR2YUV)
+            # U and V are centred at 0.5
+            noiseMatchedByDogLevel = [noiseLevelYuv[:,:,0] * min(3.0, yuvScaleDogLevel[0])]
+            noiseMatchedByDogLevel += [(noiseLevelYuv[:,:,1] - 0.5) * min(3.0, yuvScaleDogLevel[1]) + 0.5]
+            noiseMatchedByDogLevel += [(noiseLevelYuv[:,:,2] - 0.5) * min(3.0, yuvScaleDogLevel[2]) + 0.5]
+            noiseMatchedByDog += cv2.cvtColor(np.float32(np.stack(noiseMatchedByDogLevel, axis=-1)), cv2.COLOR_YUV2BGR)
+
+            #noiseMatchedByDog += cv2.cvtColor(cv2.cvtColor(np.float32(noiseDog[dogLevel] * min(3.0, yuvScaleDogLevel[0])), cv2.COLOR_BGR2YUV), cv2.COLOR_YUV2BGR)
+
             yuvScaleDog += [yuvScaleDogLevel]
-        # cv2.imwrite(f'{noiseLayerFilePath}-dogmatch.png', np.uint8(noiseMatchedByDog)+128)
+        #cv2.imwrite(f'{noiseLayerFilePath}-dogmatch.png', np.uint8(noiseMatchedByDog)+128)
         #print(yuvScaleDog)
 
         hrPix = np.float32(cv2.imread(outHrFilePath, cv2.IMREAD_COLOR))
 
-        # add more noise to dark areas to fix noise loss in dark areas
-        # 60% and higher = 1.0, 30% = 1.2, 15% = 1.4, 7.5% = 1.6 and so on. This is found emperically. The noise multiplier goes up to 2.45
-        hrY = cv2.cvtColor(hrPix, cv2.COLOR_BGR2GRAY)
-        noiseScaleByBrightness = np.ones_like(hrY) + np.log(np.clip(hrY, 1, 255*0.4) / (255*0.4)) / np.log(0.5) * 0.2
-        noiseScaleByBrightnessRgb = np.tile(np.expand_dims(noiseScaleByBrightness, 2), (1, 1, 3)) # repeat each value for the RGB channels to make the shape the same as hrPix and noiseMatchedByDog
-        hrPix += np.multiply(noiseMatchedByDog, noiseScaleByBrightnessRgb)
+        # P/B frames distort the noise more. The distortion causes the noise amount detected by covariance to be lower than the perceived noise amount.
+        subjectiveAdjFactor = 1.1 if noiseFrameToUse == 0 else 1.4
 
-        #hrPix += noiseMatchedByDog * 2.0
+        # # add more noise to dark areas to fix noise loss in dark areas
+        # # 60% and higher = 1.0, 30% = 1.2, 15% = 1.4, 7.5% = 1.6 and so on. This is found emperically. The noise multiplier goes up to 2.45
+        # hrY = cv2.cvtColor(hrPix, cv2.COLOR_BGR2GRAY)
+        # noiseScaleByBrightness = np.ones_like(hrY) + np.log(np.clip(hrY, 1, 255*0.05) / (255*0.05)) / np.log(0.5) * 0.1
+        # noiseScaleByBrightnessRgb = np.tile(np.expand_dims(noiseScaleByBrightness, 2), (1, 1, 3)) # repeat each value for the RGB channels to make the shape the same as hrPix and noiseMatchedByDog
+        # hrPix += np.multiply(noiseMatchedByDog, noiseScaleByBrightnessRgb) * subjectiveAdjFactor
+
+        hrPix += noiseMatchedByDog * subjectiveAdjFactor
 
         cv2.imwrite(outHrFilePath, np.uint8(np.clip(hrPix, 0, 255)))
 
