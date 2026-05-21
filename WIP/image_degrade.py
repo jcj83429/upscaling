@@ -410,6 +410,8 @@ def processInFile(inFile):
     noiseSaturation = 100
     noiseDegrade = False
     noiseDownFilter = None
+    noisePickIntraFrame = False
+    noiseUseEdgeMask = False
     if NOISE:
         noiseType = random.choices([None, 'Gaussian', 'Poisson', 'Laplacian'], [18, 1, 1, 0])[0]
         if noiseType is not None:
@@ -434,6 +436,11 @@ def processInFile(inFile):
             else:
                 noiseDownFilter = random.choice(['Mitchell', 'Catrom', 'Lanczos', 'Gaussian', 'Spline', 'Triangle'])
                 name += noiseDownFilter
+            noisePickIntraFrame = random.randrange(3) == 0
+            if noisePickIntraFrame:
+                noiseUseEdgeMask = False
+            else:
+                noiseUseEdgeMask = random.random() < 0.5
 
     # The goal of training with anamorphic encoding is to train the model to recognize resized compression artifacts
     anamorphicWidth = inX // FACTOR
@@ -502,18 +509,18 @@ def processInFile(inFile):
         if random.randrange(2) == 0:
             noiseDegradeFlags += ['-blur', f'0x{random.randint(1, 10)/10}']
 
-        # Add more noise around edges than flat areas. The model has issues with noise amplification in areas of high edge density but no issues in flat ares.
-        # Training with noise in LR inevitably causes the model to denoise even with attempts to generate matching noise in HR because compression changes the noise in very unpredictable ways so the noise matching is not perfect.
-        # So concentrate the effect around edges.
-        # magick /mnt/ss/dataset/problem_lr/taboo.png -resize 25% -edge 1 -clamp -morphology Dilate Diamond -blur 0x10 -brightness-contrast 40x70 -resize 400% -colorspace gray edge.png
-        noiseAlphaMaskFile = os.path.join(outDirHR, outBaseName+f'-noisemask.png')
-        subprocess.run(['convert', inFilePath, '-resize', '25%', '-edge', '1', '-clamp', '-morphology', 'Dilate', 'Diamond', '-blur', '0x6', '-brightness-contrast', '30x80', '-resize', f'{inX}x{inY}', '-colorspace', 'gray'] + lowPngCompressionFlags + [noiseAlphaMaskFile], check=True, capture_output=True)
-        tempFiles += [noiseAlphaMaskFile]
-
         noiseGenAlphaMaskFlags = []
-        # Apply edge mask to noise with some probability. This trains the model to denoise less in flat areas.
-        # if random.random() < 0.7:
-        #     noiseGenAlphaMaskFlags = [noiseAlphaMaskFile, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite']
+        # Apply alpha mask to noise with some probability.
+        if noiseUseEdgeMask:
+            noiseAlphaMaskFile = os.path.join(outDirHR, outBaseName+f'-noisemask.png')
+            tempFiles += [noiseAlphaMaskFile]
+            # Add more noise around edges than flat areas. The model has issues with noise amplification in areas of high edge density but no issues in flat ares.
+            # Training with noise in LR inevitably causes the model to denoise even with attempts to generate matching noise in HR because compression changes the noise in very unpredictable ways so the noise matching is not perfect.
+            # So concentrate the effect around edges.
+            # magick /mnt/ss/dataset/problem_lr/taboo.png -resize 25% -edge 1 -clamp -morphology Dilate Diamond -blur 0x10 -brightness-contrast 40x70 -resize 400% -colorspace gray edge.png
+            subprocess.run(['convert', inFilePath, '-resize', '25%', '-edge', '1', '-clamp', '-morphology', 'Dilate', 'Diamond', '-blur', '0x6', '-brightness-contrast', '30x80', '-resize', f'{inX}x{inY}', '-colorspace', 'gray'] + lowPngCompressionFlags + [noiseAlphaMaskFile], check=True, capture_output=True)
+            noiseGenAlphaMaskFlags = [noiseAlphaMaskFile, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite']
+
         noiseGenFlags = ['-duplicate', '1', # stack: HR1, HR2
                         '-attenuate', str(noiseAtten), '+noise', noiseType, # add noise to HR2
                         '-compose', 'Mathematics', '-define', 'compose:args=0,1,-1,0.5', '-composite', # noise = HR2 - HR1 + 0.5
@@ -613,7 +620,7 @@ def processInFile(inFile):
 
     if noiseType is not None:
         # Pick I frame with 1/3 probability
-        noiseFrameToUse = 0 if random.randrange(3) == 0 else random.randrange(1, noiseFrames * noiseRepeat)
+        noiseFrameToUse = 0 if noisePickIntraFrame else random.randrange(1, noiseFrames * noiseRepeat)
         noiseLayerFilePath = os.path.join(outDirHR, outBaseName+f'-noiselayer{noiseFrameToUse%noiseFrames}.png')
         lrFrameFilePath = os.path.join(outDirLR, outBaseName+f'-{noiseFrameToUse+1}.png')
         os.rename(lrFrameFilePath, outFilePath)
@@ -682,7 +689,7 @@ def processInFile(inFile):
         hrPix = np.float32(cv2.imread(outHrFilePath, cv2.IMREAD_COLOR))
 
         # P/B frames distort the noise more. The distortion causes the noise amount detected by covariance to be lower than the perceived noise amount.
-        subjectiveAdjFactor = 1.1 if noiseFrameToUse == 0 else 1.4
+        subjectiveAdjFactor = 1.2 if noiseFrameToUse == 0 else 1.4
 
         # # add more noise to dark areas to fix noise loss in dark areas
         # # 60% and higher = 1.0, 30% = 1.2, 15% = 1.4, 7.5% = 1.6 and so on. This is found emperically. The noise multiplier goes up to 2.45
