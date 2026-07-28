@@ -437,10 +437,11 @@ def processInFile(inFile):
                 noiseDownFilter = random.choice(['Mitchell', 'Catrom', 'Lanczos', 'Gaussian', 'Spline', 'Triangle'])
                 name += noiseDownFilter
             noisePickIntraFrame = random.randrange(3) == 0
-            if noisePickIntraFrame:
-                noiseUseEdgeMask = False
-            else:
-                noiseUseEdgeMask = random.random() < 0.5
+            # if noisePickIntraFrame:
+            #     noiseUseEdgeMask = False
+            # else:
+            #     noiseUseEdgeMask = random.random() < 0.5
+            noiseUseEdgeMask = random.random() < 0.7
 
     # The goal of training with anamorphic encoding is to train the model to recognize resized compression artifacts
     anamorphicWidth = inX // FACTOR
@@ -453,11 +454,19 @@ def processInFile(inFile):
         name += '-' + subsampling
 
     # there is no lossless option. high quality compressed is close enough
+    # # x262 is only used when not adding noise. It handles noise unpredictably, but it has adaptive quant. Most real DVDs use adaptive quant.
+    # if noiseType is not None:
+    #     compression = random.choices(['asp', 'mpg', 'h264', 'vp9', 'h265'], [15, 15, 35, 15, 20])[0]
+    # else:
+    #     compression = random.choices(['asp', 'mpg', 'x262', 'h264', 'vp9', 'h265'], [15, 7, 8, 35, 15, 20])[0]
     compression = random.choices(['asp', 'mpg', 'h264', 'vp9', 'h265'], [15, 15, 35, 15, 20])[0]
+
     if compression == 'asp':
         qualityRange = (7, 1)
     elif compression == 'mpg':
         qualityRange = (7, 1)
+    elif compression == 'x262':
+        qualityRange = (12, 3)
     elif compression == 'h264':
         qualityRange = (25, 14) if noiseType else (23, 16)
     elif compression == 'vp9':
@@ -573,16 +582,33 @@ def processInFile(inFile):
     ffPostCompressionResizeFlags = ['-s', f'{inX//FACTOR}x{inY//FACTOR}']
 
     if compression == 'asp':
+        spatialAq = random.choice([True, False])
+        spatialAqFlags = ['-variance_aq', '1'] if spatialAq else []
         outTmpFilePath = outFilePath+'.avi'
-        subprocess.run(['ffmpeg', '-i', ffmpegInputFile] + ffSubsamplingFlags + ['-q', quality, '-g', '1000', '-keyint_min', '1000', '-pix_fmt', 'yuv420p'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile] + ffSubsamplingFlags + ['-q', quality, '-g', '1000', '-keyint_min', '1000', '-pix_fmt', 'yuv420p', '-c:v', 'libxvid'] + spatialAqFlags + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         subprocess.run(['ffmpeg', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         tempFiles += [outTmpFilePath]
     elif compression == 'mpg':
+        # note: ffmpeg's mpeg2video encoder doesn't use spatial AQ. This is an insufficient simulation of mpeg2 compression.
         outTmpFilePath = outFilePath+'.mpg'
-        subprocess.run(['ffmpeg', '-i', ffmpegInputFile] + ffSubsamplingFlags + ['-q', quality, '-g', '1000', '-keyint_min', '1000', '-pix_fmt', 'yuv420p', '-c:v', 'mpeg2video'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        # ffmpeg defaults to linear quant but most real DVDs use non-linear quant
+        nonLinearQuantFlags = random.choice([[], ['-non_linear_quant', '1', '-qmax', '28']])
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile] + ffSubsamplingFlags + ['-q', quality, '-g', '1000', '-keyint_min', '1000', '-pix_fmt', 'yuv420p', '-c:v', 'mpeg2video'] + nonLinearQuantFlags + ffPreCompressionResizeFlags + ffHqChromaFlags + [outTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         overwriteFlags = ['-update', '1'] if '%d' not in ffmpegOutputFile else []
         subprocess.run(['ffmpeg', '-c:v', 'mpeg2video', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + overwriteFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
         tempFiles += [outTmpFilePath]
+    elif compression == 'x262':
+        # colour spaces are such bullshit. These are the commands to convert RGB->YUV->RGB without colour shift
+        # ffmpeg -i mpv-shot0001.png -pix_fmt yuv420p -colorspace bt709 mpv-shot0001.y4m
+        # ffmpeg -color_range 1 -colorspace 1 -color_primaries 1 -i mpv-shot0001.y4m -pix_fmt rgb24 -sws_flags +accurate_rnd+full_chroma_int mpv-shot0001.y4m.png
+        y4mTmpFilePath = outFilePath+'.y4m'
+        outTmpFilePath = outFilePath+'.mpg'
+        aqStr = str(random.randint(2, 10) / 10)
+        subprocess.run(['ffmpeg', '-i', ffmpegInputFile] + ffSubsamplingFlags + [ '-pix_fmt', 'yuv420p', '-colorspace', 'bt709'] + ffPreCompressionResizeFlags + ffHqChromaFlags + [y4mTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(['x262', '--fps', '24', '--crf', quality, '--aq-strength', aqStr, '--dc', '10', '--no-mbtree', '-o', outTmpFilePath, y4mTmpFilePath], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        overwriteFlags = ['-update', '1'] if '%d' not in ffmpegOutputFile else []
+        subprocess.run(['ffmpeg', '-f', 'mpegvideo', '-c:v', 'mpeg2video', '-color_range', '1', '-colorspace', '1', '-color_primaries', '1', '-i', outTmpFilePath, '-pix_fmt', 'rgb24'] + ffPostCompressionResizeFlags + ffHqChromaFlags + overwriteFlags + [ffmpegOutputFile], check=True, capture_output=True, stdin=subprocess.DEVNULL)
+        tempFiles += [y4mTmpFilePath, outTmpFilePath]
     elif compression == 'h264':
         outTmpFilePath = outFilePath+'.mkv'
         x264flags = ['-g', '1000', '-keyint_min', '1000']
@@ -689,7 +715,7 @@ def processInFile(inFile):
         hrPix = np.float32(cv2.imread(outHrFilePath, cv2.IMREAD_COLOR))
 
         # P/B frames distort the noise more. The distortion causes the noise amount detected by covariance to be lower than the perceived noise amount.
-        subjectiveAdjFactor = 1.2 if noiseFrameToUse == 0 else 1.4
+        subjectiveAdjFactor = 1.2 if noiseFrameToUse == 0 else 1.3
 
         # # add more noise to dark areas to fix noise loss in dark areas
         # # 60% and higher = 1.0, 30% = 1.2, 15% = 1.4, 7.5% = 1.6 and so on. This is found emperically. The noise multiplier goes up to 2.45
@@ -718,3 +744,5 @@ with multiprocessing.pool.ThreadPool(24) as threadPool:
 #    threadPool.map(processInFile, inFiles)
     for _ in tqdm.tqdm(threadPool.imap_unordered(processInFile, inFiles), total=len(inFiles)):
         pass
+
+#subprocess.run(['cp', sys.argv[0], os.path.join(outDirLR, 'image_degrade.py')])
