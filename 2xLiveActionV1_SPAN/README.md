@@ -5,7 +5,7 @@
 **Links:** https://github.com/jcj83429/upscaling/tree/main/2xLiveActionV1_SPAN
 
 **Author:** jcj83429
-**License:** CC BY-NC-SA 4.0
+**License:** Apache License 2.0
 **Purpose:** Compression Removal, Deblur, Dehalo, General Upscaler
 **Subject:** Video Frame
 **Input Type:** Images
