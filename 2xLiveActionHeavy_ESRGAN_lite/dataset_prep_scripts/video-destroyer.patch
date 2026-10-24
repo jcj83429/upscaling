@@ -1,0 +1,156 @@
+diff --git a/config.yaml b/config.yaml
+index 3095a24..dd8a8cc 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -1,14 +1,14 @@
+ # Use forward slashes or double backslashes for Windows paths
+ # Input can be either a single video file or a folder containing multiple videos
+ # The system will auto-detect which mode to use
+-input: "C:/Users/mystery/Pictures/Datasets/video-destroyer/picnic.mkv"
++input: "/home/archuser/bfc.mkv"
+ video_extensions: [".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv"]  # Used when input is a folder
+ 
+ chunks_directory: "chunks"  # Will contain HR and LR subfolders (or per-video subfolders when processing folder)
+-use_existing_chunks: false  # When true, skips video splitting and processes existing HR chunks
++use_existing_chunks: true  # When true, skips video splitting and processes existing HR chunks
+ 
+ # Chunk settings
+-chunk_strategy: "scene_detection"  # Options: "duration", "scene_detection", "frame_count"
++chunk_strategy: "duration"  # Options: "duration", "scene_detection", "frame_count"
+ frames_per_chunk: 5  # Number of frames per chunk (used if chunk_strategy is "frame_count")
+ chunk_duration: 15  # Duration in seconds (used if chunk_strategy is "duration")
+ min_chunk_duration: 1  # Minimum chunk duration for scene detection
+@@ -56,10 +56,10 @@ degradations:
+     params:
+       fixed_scale: 0.5
+       down_up:
+-        enabled: false
++        enabled: true
+         probability: 0.5  # 70% chance to apply down-up when resize is active
+-        range: [0.75, 1]  # [min, max] downscale factors
+-      scaling_filters: ["bicubic", "bilinear", "area"]  # Options: fast_bilinear, bilinear, bicubic, neighbor, area, bicublin, gauss, sinc, lanczos, spline
++        range: [0.3, 0.625]  # [min, max] downscale factors
++      scaling_filters: ["lanczos", "bicubic", "bilinear", "area"]  # Options: fast_bilinear, bilinear, bicubic, neighbor, area, bicublin, gauss, sinc, lanczos, spline
+ 
+   - name: "noise"
+     enabled: false
+@@ -79,7 +79,7 @@ degradations:
+       luma_amount_range: [0, 0.5]  # Strength of the effect
+ 
+   - name: "blur"
+-    enabled: true
++    enabled: false
+     probability: 0.4
+     params:
+       enabled_types: ["gaussian"] # ["gaussian", "box", "motion"]
+@@ -130,8 +130,8 @@ degradations:
+     params:
+       h264:
+         probability: 0.6
+-        quality_range: [23, 33]  # [min, max] CRF values
+-        presets: ["veryslow"]  # Randomly select from these presets
++        quality_range: [14, 20]  # [min, max] CRF values
++        presets: ["medium", "slow", "slower", "veryslow"]  # Randomly select from these presets
+       h265:
+         probability: 0
+         quality_range: [0, 0]
+@@ -144,23 +144,26 @@ degradations:
+         quality_range: [25, 30]
+         preset_range: [2, 8]  # [min, max] preset values (0=slowest, 13=fastest)
+       mpeg2:
+-        probability: 0.4
+-        quality_range: [6000, 10000]  # bitrate in kbps (2-8 Mbps)
++        probability: 0.2
++        quality_range: [2, 4]
++      asp:
++        probability: 0.2
++        quality_range: [2, 5]
+ 
+ # Frame extraction settings
+ frame_extraction:
+   auto_extract_frames: true  # Automatically extract frames after video processing completes
+-  output_directory: "frames_bf6_bink"  # Directory to save extracted frames
+-  sequence_length: 5  # Number of frames in each sequence
++  output_directory: "imgout"  # Directory to save extracted frames
++  sequence_length: 1  # Number of frames in each sequence
+   
+   # Extraction mode (mutually exclusive - only one mode is active at a time):
+   # Priority: use_scene_detection > extract_full_chunks > time_gap/frame_skip
+   use_scene_detection: false  # Use scene detection to determine sequence start points (ignores time_gap/frame_skip/extract_full_chunks)
+-  extract_full_chunks: true  # Extract all possible sequences without overlap (ignores time_gap/frame_skip)
++  extract_full_chunks: false  # Extract all possible sequences without overlap (ignores time_gap/frame_skip)
+   
+   # Gap settings (only used when both use_scene_detection and extract_full_chunks are false):
+   time_gap: 0  # Time in seconds to skip between sequences (set to 0 to use frame_skip instead)
+-  frame_skip: 0  # Alternative to time_gap: specific number of frames to skip (only used if time_gap is null/0)
++  frame_skip: 10  # Alternative to time_gap: specific number of frames to skip (only used if time_gap is null/0)
+   
+   # Other settings:
+   max_sequences_per_chunk: null  # Max sequences to extract per chunk (null for unlimited)
+diff --git a/utils/degradation_pipeline.py b/utils/degradation_pipeline.py
+index 56b7660..a650714 100644
+--- a/utils/degradation_pipeline.py
++++ b/utils/degradation_pipeline.py
+@@ -3,6 +3,8 @@ import logging
+ import ffmpeg
+ from .degradations.base_degradation import BaseDegradation
+ from .degradations.codec_degradation import CodecDegradation
++import subprocess
++import random
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -41,6 +43,7 @@ class DegradationPipeline:
+         applied_degradations = []
+         skipped_degradations = []
+         filter_expressions = []
++        telecine = random.randrange(3) < 1
+         
+         # Check which non-codec degradations should be applied
+         for i, degradation in enumerate(self.degradations):
+@@ -79,11 +82,15 @@ class DegradationPipeline:
+         if filter_expressions:
+             # Join all filter expressions with commas
+             complex_filter = ','.join(filter_expressions)
++            if telecine:
++                complex_filter += ',telecine=t'
+             logger.debug(f"Applied filter chain: {complex_filter}")
+             
+             # Use the complex_filter parameter in the output directly
+             # instead of calling filter_complex() on the stream
+             output_args = {'filter_complex': complex_filter}
++            if telecine:
++                output_args['flags'] = '+ildct'
+         else:
+             output_args = {}
+         
+@@ -123,5 +130,13 @@ class DegradationPipeline:
+             logger.error(f"FFmpeg error processing {input_path}:")
+             logger.error(stderr)
+             raise RuntimeError(f"FFmpeg error: {stderr}")
++
++        if telecine:
++            # IVTC
++            # fieldmatch is unreliable for the first few frames, and we know the exact telecine cycle (2-3), so manually selecting fields is the best way.
++            ivtc_temp_path = output_path + '.ivtc.mkv'
++            subprocess.run(['ffmpeg', '-i', output_path, '-filter_complex', "setfield=tff,separatefields,select=outputs=10:expr='mod(n\,10)+1' [f0t][f0b][f1t][f1b][f1t2][f2b][f2t][f3b2][f3t][f3b];  [f1t2] nullsink; [f3b2] nullsink; [f0t][f0b] interleave,weave=t [f0]; [f1t][f1b] interleave,weave=t [f1]; [f2b][f2t] interleave,weave=b [f2]; [f3t][f3b] interleave,weave=t [f3]; [f0][f1][f2][f3] interleave=4,setfield=prog,setpts=N/(12*TB) [ivtcout]", '-map', '[ivtcout]', '-c:v', 'ffv1', ivtc_temp_path], check=True, capture_output=True, stdin=subprocess.DEVNULL)
++            subprocess.run(['mv', output_path, output_path + '.telecine'])
++            subprocess.run(['mv', ivtc_temp_path, output_path])
+         
+-        return output_path
+\ No newline at end of file
++        return output_path
+diff --git a/utils/degradations/codec_degradation.py b/utils/degradations/codec_degradation.py
+index 46401c2..eed8997 100644
+--- a/utils/degradations/codec_degradation.py
++++ b/utils/degradations/codec_degradation.py
+@@ -69,7 +69,8 @@ class CodecDegradation(BaseDegradation):
+             'h265': {'vcodec': 'libx265', 'crf': quality, 'preset': preset if preset else 'veryslow'},
+             'vp9': {'vcodec': 'libvpx-vp9', 'crf': quality, 'b': 0},
+             'av1': {'vcodec': 'libsvtav1', 'crf': quality, 'preset': preset if preset is not None else 2},
+-            'mpeg2': {'vcodec': 'mpeg2video', 'b': f'{quality}k'}  # Use 'b' for bitrate in kbps
++            'mpeg2': {'vcodec': 'mpeg2video', 'q': quality },  # Use 'b' for bitrate in kbps
++            'asp' : {'vcodec': 'mpeg4', 'q' : quality },
+         }
+         
+         return {**common_params, **codec_params[codec]}
